@@ -119,7 +119,7 @@ sgl-amd-mono/
 │   │   ├── weights.py   # the layer views the kernels read
 │   │   └── gfx950/      # kernels and launch runner
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
-│   └── qwen38_flash_next/   # Qwen3.8-Flash-Next; spec and kernels land in its PR
+│   └── qwen38_flash_next/   # Qwen3.8-Flash-Next: verify and MTP draft monokernels (NEXTN, TP1)
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
     ├── kernels/         # GPU: each launch against SGLang's reference ops
