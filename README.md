@@ -102,6 +102,7 @@ If the model, GPU or configuration is not supported, the server refuses to start
 sgl-amd-mono/
 ├── sgl_amd_mono/
 │   ├── common/          # HIP device runtime: guarded waits, epochs, peer memory
+│   ├── deepseek_v4/     # DeepSeek-V4-Pro; spec and kernels land in its PR
 │   ├── deepseek_v41/
 │   │   ├── spec.py      # target model: spec and forward
 │   │   ├── draft.py     # DSpark draft model: spec and forward
