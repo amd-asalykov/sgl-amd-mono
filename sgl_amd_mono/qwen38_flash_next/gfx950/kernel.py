@@ -381,6 +381,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     # inline index prep (layout.qsa_inline): scores' own compressed keys [R CN][64] words past the q rows
     QI_INLINE = LY.qsa_inline(NT)
     CK_OFF = QI_OFF + 4 * NT * 68
+    CK_NK1 = L // 4 + 1  # groups that can complete in L tokens
+    CK_NG = R * CK_NK1
+    CK_NPS = (CK_NG + 3) // 4  # compression passes of 4 groups (one per 128-thread quarter)
     assert not QI_INLINE or CK_OFF + R * CN * 64 <= TAIL_OFF
     assert QI_OFF + 4 * NT * 68 <= TAIL_OFF and PREP_KEYS + L * 128 <= TAIL_OFF
 
@@ -4126,19 +4129,18 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                 return out
 
-            def scores_inline_prep(layer, inb0, r0, gf0, bc0, kb0):
+            def scores_inline_prep(layer, inb0, r0, gf0, bc0, kb0, pre=None):
                 """(QI_INLINE) What prep-idx published, computed by this scores CTA: the index q rows of every batch
                 row (norm + rope, prep's heads_norm_rope -> QI_OFF [4 S][QS]) and the compressed key of every group
                 completed inside the batch (prep's code, 4 groups a pass on the thread quarters -> CK_OFF). Same code
                 and reduction trees as prep -> bitwise. The loads addressed by positions (ring members, rope
-                positions, cos / sin, norm weight) are issued before the qp poll; the batch members' index k share it."""
+                positions, cos / sin, norm weight) are issued before the qp poll (pre: their first level, issued at
+                the start of the layer); the batch members' index k share it."""
                 qp = mb(layer, "qp")
                 r_cos = _rsrc(ptr(GI, LY.G_COS))
                 r_ring = _rsrc(ptr(layer, LY.P_RING))
                 r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
-                NK1 = L // 4 + 1  # groups that can complete in L tokens
-                NG = R * NK1
-                NPS = (NG + 3) // 4  # passes of 4 groups (one per 128-thread quarter)
+                NPS = CK_NPS
                 qtr = tid // 128
                 e = tid % 128
                 wk = fx.Float32(
@@ -4149,43 +4151,39 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 grp = []
                 kspecs = []
                 for p_ in range_constexpr(NPS):
-                    sg = fx.min(qtr + 4 * p_, fx.Int32(NG - 1))
-                    r = sg // NK1
-                    k = sg % NK1
-                    pos0 = _uniform(lds_ld(xi, RQ_P0 + r))
-                    req = _uniform(lds_ld(xi, RQ_REQ + r))
-                    tok0 = r * L
-                    g = pos0 // 4 + k
-                    valid = (qtr + 4 * p_ < NG) & (g < (pos0 + L) // 4)
+                    r, k, req, pos0, tok0, g, valid = ck_group(p_)
                     ps = g * 4  # group start: rope position of the first member
                     psc = fx.max(ps, fx.Int32(0))
-                    rmem = [
-                        fx.Float32(
-                            fx.BFloat16(
-                                bo.buffer_load(
-                                    r_ring,
-                                    (req * ring + fx.max(ps + m_, fx.Int32(0)) % ring) * 128 + e,
-                                    vec_width=1,
-                                    dtype=T.bf16,
+                    if const_expr(pre is not None):
+                        rmem, rp_buf = pre[p_]
+                    else:
+                        rmem = [
+                            fx.Float32(
+                                fx.BFloat16(
+                                    bo.buffer_load(
+                                        r_ring,
+                                        (req * ring + fx.max(ps + m_, fx.Int32(0)) % ring) * 128 + e,
+                                        vec_width=1,
+                                        dtype=T.bf16,
+                                    )
                                 )
                             )
-                        )
-                        for m_ in range(4)
-                    ]
+                            for m_ in range(4)
+                        ]
+                        rp_buf = [
+                            _uniform(
+                                fx.Int32(
+                                    bo.buffer_load(
+                                        r_rp,
+                                        ((req * ring + psc % ring) * 3 + a) * 2,
+                                        vec_width=1,
+                                        dtype=T.i32,
+                                    )
+                                )
+                            )
+                            for a in range(3)
+                        ]
                     tsb = ps - pos0
-                    rp_buf = [
-                        _uniform(
-                            fx.Int32(
-                                bo.buffer_load(
-                                    r_rp,
-                                    ((req * ring + psc % ring) * 3 + a) * 2,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                )
-                            )
-                        )
-                        for a in range(3)
-                    ]
 
                     def sp3(a, tsb=tsb, rp_buf=rp_buf, valid=valid, tok0=tok0):
                         from_lds = lds_ld(xi, POS3 + a * NT + tok0 + fx.max(tsb, fx.Int32(0)))
@@ -4243,7 +4241,79 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 gpu.barrier()
                 return ck_select(inb0, r0, gf0, bc0, kb0)
 
-            def stage_qsa_scores(layer):
+            def scores_item(item):
+                """Work item ``item`` of the index scores: (request, its first verify position, first group that can
+                complete in the batch, this lane's block, its clamped block, the request's req_to_token row)."""
+                r = _uniform(find_bucket(SC_PFX, R, item))
+                tl = item - lds_ld(xi, SC_PFX + r)
+                pos0 = req_p0(r)
+                nb_all = (pos0 + L) // 4
+                gfirst = pos0 // 4
+                rtt_row = rtt_row_of(r)
+                blk = tl * 16 + lane % 16
+                # (>= 0 only matters for a wave without an item, whose loads must stay in range)
+                bc = fx.max(fx.min(blk, nb_all - 1), fx.Int32(0))
+                return r, pos0, gfirst, blk, bc, rtt_row
+
+            def scores_pre(layer):
+                """(QH and QI_INLINE) The first level of the index scores' dependent load chains, issued at the start of
+                the QSA layer (they land during qsa_proj round 0): the wave's first item's req_to_token entry (-> its
+                compressed-key slot) and, per compression pass, the group's ring members and its rope position (-> its
+                cos / sin). The second level is issued right before the qp poll."""
+                stask = placed(QH.sbase)
+                gw = stask * WAVES + wave
+                r, pos0, gfirst, blk, bc, rtt_row = scores_item(gw)
+                rtt0 = rtt_at(rtt_row, bc * 4)
+                r_ring = _rsrc(ptr(layer, LY.P_RING))
+                r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
+                passes = []
+                for p_ in range_constexpr(CK_NPS):
+                    r, k, req, pos0, tok0, g, valid = ck_group(p_)
+                    ps = g * 4  # group start: rope position of the first member
+                    psc = fx.max(ps, fx.Int32(0))
+                    rmem = [
+                        fx.Float32(
+                            fx.BFloat16(
+                                bo.buffer_load(
+                                    r_ring,
+                                    (req * ring + fx.max(ps + m_, fx.Int32(0)) % ring) * 128 + tid % 128,
+                                    vec_width=1,
+                                    dtype=T.bf16,
+                                )
+                            )
+                        )
+                        for m_ in range(4)
+                    ]
+                    rp_buf = [
+                        _uniform(
+                            fx.Int32(
+                                bo.buffer_load(
+                                    r_rp,
+                                    ((req * ring + psc % ring) * 3 + a) * 2,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                        )
+                        for a in range(3)
+                    ]
+                    passes.append((rmem, rp_buf))
+                return rtt0, passes
+
+            def ck_group(p_):
+                """(QI_INLINE) Compression pass p_: this thread quarter's group (request r, k-th group completing in
+                the batch) -> (r, k, req, pos0, tok0, group index, valid)."""
+                qtr = tid // 128
+                sg = fx.min(qtr + 4 * p_, fx.Int32(CK_NG - 1))
+                r = sg // CK_NK1
+                k = sg % CK_NK1
+                pos0 = _uniform(lds_ld(xi, RQ_P0 + r))
+                req = _uniform(lds_ld(xi, RQ_REQ + r))
+                g = pos0 // 4 + k
+                valid = (qtr + 4 * p_ < CK_NG) & (g < (pos0 + L) // 4)
+                return r, k, req, pos0, r * L, g, valid
+
+            def stage_qsa_scores(layer, pre=None):
                 """Index logits of every complete block for every row: ilog[t][b] for b < nb_t = (pos_t + 1) // 4.
                 Work item = (request r, tile of 16 blocks of its context), handled by the global wave item % (256 * 8).
                 MFMA: A = index q rows (row, head) of request r from LDS, B = 16 compressed keys (blocks), k = 128 dims;
@@ -4260,17 +4330,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     cnew = mb(layer, "cnew")
                     ilog = mb(layer, "ilog")
 
-                    def item_setup(item):
-                        r = _uniform(find_bucket(SC_PFX, R, item))
-                        tl = item - lds_ld(xi, SC_PFX + r)
-                        pos0 = req_p0(r)
-                        nb_all = (pos0 + L) // 4
-                        gfirst = pos0 // 4
-                        rtt_row = rtt_row_of(r)
-                        blk = tl * 16 + lane % 16
-                        # (>= 0 only matters for a wave without an item, whose loads must stay in range)
-                        bc = fx.max(fx.min(blk, nb_all - 1), fx.Int32(0))
-                        cslot = rtt_at(rtt_row, bc * 4) // 4
+                    def item_setup(item, rtt0=None):
+                        r, pos0, gfirst, blk, bc, rtt_row = scores_item(item)
+                        cslot = (rtt_at(rtt_row, bc * 4) if rtt0 is None else rtt0) // 4
                         kb = [
                             fx.Vector(
                                 bo.buffer_load(
@@ -4329,10 +4391,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
                     # item 0 of this wave (it may have none: nloop == 0 -> nothing is put)
                     live0 = gw < ntile
-                    r0, p00, gf0, blk0, bc0, kb0 = item_setup(gw)
+                    r0, p00, gf0, blk0, bc0, kb0 = item_setup(
+                        gw, None if pre is None else pre[0]
+                    )
                     inb0 = live0 & (bc0 >= gf0)  # compressed inside this batch: from the mailbox
                     if const_expr(QI_INLINE):
-                        kb0 = scores_inline_prep(layer, inb0, r0, gf0, bc0, kb0)
+                        kb0 = scores_inline_prep(
+                            layer, inb0, r0, gf0, bc0, kb0, None if pre is None else pre[1]
+                        )
                     else:
                         NW = 256 * NT
                         NIW = (NW + THREADS - 1) // THREADS
@@ -6064,13 +6130,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     lane = tid % 64
                     wave = tid // 64
                 if const_expr(kind == "qsa" and QH is not None and QI_INLINE):
-                    # index-chain hoist + inline index prep
+                    # index-chain hoist + inline index prep (the scores' first-level loads ahead of round 0)
+                    qpre = scores_pre(li)
                     stage_qsa_proj(li, "r0")
                     mark(f"{li}.qsa_proj0")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
-                    stage_qsa_scores(li)
+                    stage_qsa_scores(li, qpre)
                     mark(f"{li}.qsa_scores")
                     tid = fresh(tid0)
                     lane = tid % 64
