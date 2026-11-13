@@ -89,6 +89,17 @@ def test_moe_padding_matches_fusedmoe_at_tp(tp):
     assert (w13_dim, w2_dim) == (2 * g.MOE_INTER_PAD, g.MOE_INTER_PAD // 2)
 
 
+def test_gate_up_wave_split_keeps_one_round():
+    # TP_PLAN commit 9: the rank's gate/up (slot, tile) tasks x waves a task fit one round of the 2048 waves
+    want = {1: [1] * 8, 2: [2] + [1] * 7, 4: [4, 2] + [1] * 6}
+    for tp, ws in want.items():
+        got = [LY.gu_wsplit(T, tp) for T in range(4, 33, 4)]
+        assert got == ws, (tp, got)
+        for T, wk in zip(range(4, 33, 4), got):
+            if wk > 1:
+                assert LY.max_slots(T) * LY.geom(tp).GU_PAIRS * wk <= 256 * 8
+
+
 def test_bad_tp_is_refused():
     for tp in (0, 3, 8):
         with pytest.raises(ValueError):
@@ -432,13 +443,13 @@ def test_parity_alternates_at_odd_launch_counts(n_launches):
 
 
 def test_the_draft_serves_the_target_tp_sizes():
-    # TP_PLAN commit 8: the MTP draft launch runs at TP 2 (the runner refuses nothing)
+    # TP_PLAN commits 8 / 9: the MTP draft launch runs at TP 2 and 4 (the runner refuses nothing)
     from sgl_amd_mono.qwen38_flash_next import draft as D
     from sgl_amd_mono.qwen38_flash_next import spec as q38
     from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
 
-    assert D.TP_SIZES == q38.TP_SIZES == (1, 2)
-    assert D.SPEC.devices["gfx950"].tp_sizes == (1, 2)
+    assert D.TP_SIZES == q38.TP_SIZES == (1, 2, 4)
+    assert D.SPEC.devices["gfx950"].tp_sizes == (1, 2, 4)
     assert not hasattr(R.DraftRunner, "refuse_tp_launch") or R.DraftRunner.refuse_tp_launch is R._Base.refuse_tp_launch
 
 
@@ -494,10 +505,9 @@ def test_compile_in_lockstep(monkeypatch, no_capture, tp, rank, first):
     assert sorted(built) == keys and built[0] == first and barriers == ["g"]
     r.compile_in_lockstep(2, keys)  # once a batch size
     assert len(built) == 5 and len(barriers) == 1
-    if tp > 2:  # TP 2 launches run (TP_PLAN commits 4-5), TP 4 not yet
-        with pytest.raises(NotImplementedError):
-            r.refuse_tp_launch()
-    else:
+    r.refuse_tp_launch()  # TP 2 and 4 launches run (TP_PLAN commits 4-5, 9)
+    r.tp = 8
+    with pytest.raises(NotImplementedError):
         r.refuse_tp_launch()
 
 

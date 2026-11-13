@@ -35,7 +35,7 @@ from sgl_amd_mono.common import guard
 
 from . import layout as LY
 from . import packing
-from .config import HC_DIM, HIDDEN, MAX_T, VOCAB, ConvStrides, MonoBuild
+from .config import HC_DIM, HIDDEN, MAX_T, TP_SIZES, VOCAB, ConvStrides, MonoBuild
 
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -266,12 +266,12 @@ class _Base:
                 )
 
     def refuse_tp_launch(self) -> None:
-        """TP 4 runs no launch yet (its stages: a 64-K out_proj unit, core_split 16,
-        6 q heads an attention task; TP_PLAN commit 9)."""
-        if self.tp > 2:
+        """Every TP the geometry is laid out for runs (TP 1 / 2 / 4, TP_PLAN commit 9:
+        core_split 16, the ragged out_proj chunks, 6 q heads an attention task, the
+        32-K MoE down tail)."""
+        if self.tp not in TP_SIZES:
             raise NotImplementedError(
-                f"Qwen3.8-Flash-Next monokernel: TP {self.tp} launches are not "
-                "implemented yet (TP 4 stages)"
+                f"Qwen3.8-Flash-Next monokernel: TP {self.tp} launches (not in {TP_SIZES})"
             )
 
     def set_deadline(self, seconds: float) -> None:

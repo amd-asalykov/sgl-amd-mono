@@ -68,11 +68,10 @@ logger = logging.getLogger(__name__)
 
 MAX_R = 8  # requests a launch takes at most (``gfx950/config.MAX_R``)
 TOKENS = 4  # rows a request: NEXTN's 3 draft steps + 1
-# the TP sizes the launches serve (``DeviceLimits.tp_sizes``): TP 2 runs each rank's
-# shard (GDN heads, QSA q heads and KV head, MoE intermediate, vocab shards) and
-# the all-reduces in the kernel (notes/TP_PLAN.md); TP 4's stages are not there yet
-# (TP_PLAN commit 9)
-TP_SIZES = (1, 2)
+# the TP sizes the launches serve (``DeviceLimits.tp_sizes``): TP 2 / 4 run each
+# rank's shard (GDN heads, QSA q heads and KV head (TP 4: head r // 2, a copy a rank),
+# MoE intermediate, vocab shards) and the all-reduces in the kernel (notes/TP_PLAN.md)
+TP_SIZES = (1, 2, 4)
 # the verify widths: whole requests of 4 rows, up to 8 (32 rows)
 WIDTHS = tuple(range(TOKENS, MAX_R * TOKENS + 1, TOKENS))
 # the kernel's GDN SSM state dtypes (``gfx950/config.MonoBuild.ssm_bf16``)

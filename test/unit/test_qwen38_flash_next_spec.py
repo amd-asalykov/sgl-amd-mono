@@ -480,7 +480,7 @@ def test_the_ple_layer_is_one_reason():
 def test_the_recipe_routes_verify_batches_of_one_to_eight():
     # NEXTN, 3 steps: 4 verify rows a request, the 4- to 32-row launches
     assert q38.SPEC.widths("gfx950") == tuple(range(4, 33, 4))
-    assert q38.SPEC.devices["gfx950"].tp_sizes == (1, 2)
+    assert q38.SPEC.devices["gfx950"].tp_sizes == (1, 2, 4)
     assert covered_capture_sizes(
         widths=q38.SPEC.widths("gfx950"), tokens_per_request=4, sizes=[1, 2, 4, 8]
     ) == list(range(1, 9))
@@ -794,7 +794,7 @@ def test_the_model_is_accepted():
 
 
 def test_each_unsupported_model_is_one_reason():
-    assert len(_model_reasons(_model(), tp=4)) == 1  # TP 4: not yet (TP_PLAN commit 9)
+    assert len(_model_reasons(_model(), tp=8)) == 1  # TP 8: not laid out (TP_SIZES 1 / 2 / 4)
     assert len(_model_reasons(_model(), context_len=MAX_CTX)) == 1
     assert len(_model_reasons(_model(capture_aux_hidden_states=True))) == 1
     lm = _model()

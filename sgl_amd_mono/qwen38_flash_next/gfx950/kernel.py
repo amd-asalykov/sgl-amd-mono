@@ -225,10 +225,6 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     # constants.
     TPW = key.tp
     GM = LY.geom(TPW)
-    if TPW > 2:
-        # TP 4 needs a 64-K out_proj unit (12 chunks over 8 waves), a 2 K-words a thread
-        # GDN core (core_split 16) and 6 q heads an attention task (TP_PLAN commit 9)
-        raise NotImplementedError(f"Qwen3.8-Flash-Next monokernel: TP {TPW} stages")
     R, L = nreq, ntok
     NT = R * L
     assert 1 <= R <= MAX_R and 1 <= NT <= MAX_T
@@ -339,9 +335,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     assert GU_ACT + NT * S_GU <= PERS_OFF, (
         "gate/up activation + route tables do not fit LDS"
     )
-    # GU_WK 2: the K-half-1 waves' gate / up accumulators [4 tasks][64 lanes][2 NCT 4] f32
+    # GU_WK > 1: the K-part k > 0 waves' gate / up accumulators [GU_WK - 1][WAVES / GU_WK tasks][64 lanes][2 NCT 4]
+    # f32
     GU_XCH = GU_ACT + NT * S_GU
-    assert GU_WK == 1 or GU_XCH + (WAVES // 2) * 64 * 8 * NCT <= PERS_OFF
+    GU_XSLOT = (WAVES // max(GU_WK, 1)) * 64 * 8 * NCT
+    assert GU_WK == 1 or GU_XCH + (GU_WK - 1) * GU_XSLOT <= PERS_OFF
     # GDN core
     C_Q = W0  # [S][288] f32 conv outputs (q 128, k 128, v 32)
     C_Z = C_Q + NT * 288  # [S][32]
@@ -2003,6 +2001,23 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 j = tid // RPT
                 c = tid % RPT
                 srow = (h * GDN_DK + s * ROWS + j) * GDN_DK + c * KPT
+                # state words a thread in CVW-wide vectors (TP 4, core_split 16: KPT 2, one 2-wide vector)
+                CVW = min(KPT, 4)
+                NQ4 = KPT // CVW
+                cvf = v4f if CVW == 4 else fx.Vector.make_type(CVW, fx.Float32)
+
+                def ld_bf16_state(r_ssm, q):
+                    w_off = (srow + CVW * q) // 2
+                    if const_expr(CVW == 2):
+                        raw = fx.Vector.from_elements(
+                            [fx.Int32(bo.buffer_load(r_ssm, w_off, vec_width=1, dtype=T.i32))],
+                            fx.Int32,
+                        )
+                    else:
+                        raw = fx.Vector(
+                            bo.buffer_load(r_ssm, w_off, vec_width=CVW // 2, dtype=T.i32)
+                        )
+                    return raw.bitcast(fx.BFloat16).to(fx.Float32)
                 msl = [_uniform(lds_ld(xi, RQ_MS + r_)) for r_ in range(R)]
                 sts = []
                 # bytes per mamba slot
@@ -2015,29 +2030,17 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                     if const_expr(ssm_bf16):
                         sts.append(
-                            [
-                                fx.Vector(
-                                    bo.buffer_load(
-                                        r_ssm,
-                                        (srow + 4 * q) // 2,
-                                        vec_width=2,
-                                        dtype=T.i32,
-                                    )
-                                )
-                                .bitcast(fx.BFloat16)
-                                .to(fx.Float32)
-                                for q in range(KPT // 4)
-                            ]
+                            [ld_bf16_state(r_ssm, q) for q in range(NQ4)]
                         )
                     else:
                         sts.append(
                             [
                                 fx.Vector(
                                     bo.buffer_load(
-                                        r_ssm, srow + 4 * q, vec_width=4, dtype=T.f32
+                                        r_ssm, srow + CVW * q, vec_width=CVW, dtype=T.f32
                                     )
                                 )
-                                for q in range(KPT // 4)
+                                for q in range(NQ4)
                             ]
                         )
                 r_cw = _rsrc(ptr(layer, LY.P_CONV_W))
@@ -2275,7 +2278,6 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 lds_st(xs, C_SC + t * 4 + 1, _exp(nega * sp))
                                 lds_st(xs, C_SC + t * 4 + 2, dqk * rq * rk)
                     gpu.barrier()
-                    NQ4 = KPT // 4
                     nw = fx.Float32(
                         bo.buffer_load(
                             _rsrc(ptr(layer, LY.P_NORM_W)),
@@ -2295,7 +2297,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # step, so the two row reductions of a token run side by side; the R requests' chains are
                     # independent and run interleaved (step j of every request, then step j + 1)
                     svs = [
-                        [sts[r_][q][e] for q in range(NQ4) for e in range(4)]
+                        [sts[r_][q][e] for q in range(NQ4) for e in range(CVW)]
                         for r_ in range(R)
                     ]
 
@@ -2303,15 +2305,22 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         """intermediate_ssm[request r_][step j_] := the state after token j_."""
                         for q in range_constexpr(NQ4):
                             st4 = fx.Vector.from_elements(
-                                sv[4 * q : 4 * q + 4], fx.Float32
+                                sv[CVW * q : CVW * q + CVW], fx.Float32
                             )
                             off = (
                                 r_ * issm_row
                                 + j_ * GM.SSM_STEP_WORDS
                                 + srow
-                                + 4 * q
+                                + CVW * q
                             )
-                            if const_expr(ssm_bf16):
+                            if const_expr(ssm_bf16 and CVW == 2):
+                                # one bf16 pair (a <1 x i32> store does not lower)
+                                bo.buffer_store(
+                                    fx.Int32(st4.to(fx.BFloat16).bitcast(fx.Int32)[0]),
+                                    r_is,
+                                    off // 2,
+                                )
+                            elif const_expr(ssm_bf16):
                                 bo.buffer_store(
                                     st4.to(fx.BFloat16).bitcast(fx.Int32),
                                     r_is,
@@ -2334,8 +2343,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             qq = [
                                 fx.Vector(
                                     fx.ptr_load(
-                                        xs + (C_Q + t * 288 + c * KPT + 4 * q),
-                                        result_type=v4f,
+                                        xs + (C_Q + t * 288 + c * KPT + CVW * q),
+                                        result_type=cvf,
                                     )
                                 )
                                 for q in range(NQ4)
@@ -2343,8 +2352,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             kk = [
                                 fx.Vector(
                                     fx.ptr_load(
-                                        xs + (C_Q + t * 288 + 128 + c * KPT + 4 * q),
-                                        result_type=v4f,
+                                        xs + (C_Q + t * 288 + 128 + c * KPT + CVW * q),
+                                        result_type=cvf,
                                     )
                                 )
                                 for q in range(NQ4)
@@ -2353,8 +2362,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             beta = lds_ld(xs, C_SC + t * 4)
                             decay = lds_ld(xs, C_SC + t * 4 + 1)
                             kq = lds_ld(xs, C_SC + t * 4 + 2)
-                            kf = [kk[q][e] for q in range(NQ4) for e in range(4)]
-                            qf = [qq[q][e] for q in range(NQ4) for e in range(4)]
+                            kf = [kk[q][e] for q in range(NQ4) for e in range(CVW)]
+                            qf = [qq[q][e] for q in range(NQ4) for e in range(CVW)]
                             sk = sv[0] * kf[0]
                             sq_ = sv[0] * qf[0]
                             for e in range_constexpr(1, KPT):
@@ -2478,8 +2487,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 r_w = rsrc_if(ptr(layer, LY.P_OUT), is_op, HIDDEN * GM.VAL_DIM)
                 NKC = GM.VAL_DIM // 128  # 48 chunks of 128 K (TP 2: 24)
                 NKH = NKC // OP_KS  # chunks per staged K part
-                CPW = NKH // WAVES
-                assert CPW * WAVES == NKH
+                # TP 4: 12 chunks over 8 waves -> chunk wave + 8 c (waves 0-3 take 2, 4-7 one; the second unit of waves
+                # 4-7 is masked: its weight loads read past the descriptor (zeros) and its B operand is a real chunk's)
+                CPW = (NKH + WAVES - 1) // WAVES
+                OP_RAGGED = CPW * WAVES != NKH
+                assert not OP_RAGGED or OP_KS == 1
                 KP = GM.VAL_DIM // OP_KS
 
                 def part_units(hh):
@@ -2487,11 +2499,18 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # part hh + 1 loads stay behind part hh's MMAs
                     rg_p = rg if hh == 0 else _ordered_i32(rg)
                     for c in range_constexpr(CPW):
-                        kc = hh * NKH + wave * CPW + c
+                        if const_expr(OP_RAGGED):
+                            kc_live = wave + WAVES * c < NKH
+                            kc = fx.min(wave + WAVES * c, NKH - 1)
+                            # a row group past the weight (2 OUT_RG x NKC x 2 KB: inside int32 byte offsets)
+                            rg_u = kc_live.select(rg_p, fx.Int32(2 * LY.OUT_RG))
+                        else:
+                            kc = hh * NKH + wave * CPW + c
+                            rg_u = rg_p
                         part.append(
                             unit_f8(
                                 r_w,
-                                rg_p,
+                                rg_u,
                                 kc,
                                 NKC,
                                 (
@@ -3022,7 +3041,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     nloop = _uniform((ntask - gw + NWV - 1) // NWV)
                     kq = 0  # K part of this wave (GU_WK 2: wave // 4)
                 else:
-                    # GU_WK 2: waves w, w + 4 share task gw (K halves); a CTA-uniform loop (the LDS exchange barriers)
+                    # GU_WK 2: waves w, w + 4 share task gw (K halves; GU_WK 4: w, w + 2, w + 4, w + 6 K quarters); a
+                    # CTA-uniform loop (the LDS exchange barriers)
                     TPC = WAVES // GU_WK
                     gw = cta * TPC + wave % TPC
                     NWV = NCTA * TPC
@@ -3063,7 +3083,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         acc_of=lambda u: 0 if u < KTP else 1,
                         nacc=2,
                     )
-                    if const_expr(GU_WK > 1):
+                    if const_expr(GU_WK == 2):
                         # K half 1 -> LDS; K half 0 adds it (acc order: half 0 + half 1)
                         xo = GU_XCH + ((wave % TPC) * 64 + lane) * (8 * NCT)
                         if kq == 1:
@@ -3076,6 +3096,22 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             accu[i] + lds_ld(xs, xo + 4 * NCT + i)
                             for i in range(4 * NCT)
                         ]
+                    elif const_expr(GU_WK > 2):
+                        # K parts k > 0 -> LDS slot k - 1; part 0 adds them in order (0 + 1 + 2 + ..)
+                        xo = GU_XCH + ((wave % TPC) * 64 + lane) * (8 * NCT)
+                        if kq > 0:
+                            xk = xo + (kq - 1) * GU_XSLOT
+                            for i in range_constexpr(4 * NCT):
+                                lds_st(xs, xk + i, accg[i])
+                                lds_st(xs, xk + 4 * NCT + i, accu[i])
+                        gpu.barrier()
+                        for k_ in range_constexpr(GU_WK - 1):
+                            xk = xo + k_ * GU_XSLOT
+                            accg = [accg[i] + lds_ld(xs, xk + i) for i in range(4 * NCT)]
+                            accu = [
+                                accu[i] + lds_ld(xs, xk + 4 * NCT + i)
+                                for i in range(4 * NCT)
+                            ]
                     for ct in range_constexpr(NCT):
                         t = lane % 16 + 16 * ct
                         tc = fx.min(t, NT - 1)
@@ -3145,8 +3181,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 (routed pairs; zero for unrouted rows) once and loops over its output row groups; partials
                 dpart[g][t][2560]; then CTA rg < 160 sums the groups, applies the combine and publishes h2 (+ sum-of-squares
                 partials)."""
-                # 128-K MXFP4 chunks per slot: KT_FULL whole + the tail chunk (TP 2: K 256 .. 319, lane groups
-                # 0, 1 of the chunk's MFMA K layout; groups 2, 3 load no weights and read zero mid)
+                # 128-K MXFP4 chunks per slot: KT_FULL whole + the tail chunk (TP 2: K 256 .. 319, lane groups 0, 1 of
+                # the chunk's MFMA K layout, groups 2, 3 load no weights and read zero mid; TP 4: K 128 .. 159, group 0)
                 KT = KT_FULL + (1 if DN_TAIL else 0)
                 NU = SG * KT
                 dn = ptr(layer, LY.P_DN)
@@ -3407,11 +3443,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
             # ---- QSA (sparse full attention)
             GI = n_layers  # global pointer-table row
-            # attention of the rank's heads: KVA kv heads of HPK q heads (TP 1: 2 x 12, TP 2: 1 x 12)
+            # attention of the rank's heads: KVA kv heads of HPK q heads (TP 1: 2 x 12, TP 2: 1 x 12, TP 4: 1 x 6)
             HQ_A, KVA = GM.HQ, GM.KV
             HPK = HQ_A // KVA
-            NQI = HQ_A * 128 // THREADS  # q words a thread
-            assert HPK == 12 and NQI * THREADS == HQ_A * 128 and KVA in (1, 2)
+            # q words a thread (TP 4: 768 words, the second only on threads < 256)
+            NQI = (HQ_A * 128 + THREADS - 1) // THREADS
+            Q_RAGGED = NQI * THREADS != HQ_A * 128
+            # zero rows [HPK, 16) of each kv head's Q tile (TP 1 / 2: rows 12-15, TP 4: 6-15)
+            NQZ = KVA * (16 - HPK) * 128
+            assert HPK in (6, 12) and KVA in (1, 2) and HPK * KVA == HQ_A
 
             def rtt_at(rtt_row, tok):
                 return fx.Int32(bo.buffer_load(rtt_row, tok, vec_width=1, dtype=T.i32))
@@ -4238,7 +4278,17 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 # segments: 512 < nb) -> computed here, so q and this thread's (block, loc) share one poll round
                 nsel = fx.min(fx.Int32(512), seq // 4)
                 qspec = [
-                    (qmb, t * (HQ_A * 128) + tid + i * THREADS, 1) for i in range(NQI)
+                    (
+                        (qmb, t * (HQ_A * 128) + tid + i * THREADS, 1)
+                        if not Q_RAGGED or (i + 1) * THREADS <= HQ_A * 128
+                        else (
+                            qmb,
+                            t * (HQ_A * 128) + fx.min(tid + i * THREADS, HQ_A * 128 - 1),
+                            1,
+                            tid + i * THREADS < HQ_A * 128,
+                        )
+                    )
+                    for i in range(NQI)
                 ]
                 if const_expr(is_blk):
                     si = c * 16 + j // 4
@@ -4251,20 +4301,40 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 for i in range_constexpr(NQI):
                     pq = tid + i * THREADS
                     hd = pq // 128
-                    lds_st(
-                        xi,
-                        ATT_Q_OFF + ((hd // HPK) * 16 + hd % HPK) * ATT_KS + pq % 128,
-                        got[i][0],
-                    )
-                for i in range_constexpr(KVA):
-                    z = tid + i * THREADS
-                    lds_st(
-                        xi,
-                        ATT_Q_OFF
-                        + ((z // 512) * 16 + 12 + (z % 512) // 128) * ATT_KS
-                        + z % 128,
-                        fx.Int32(0),
-                    )
+                    if const_expr(not Q_RAGGED or (i + 1) * THREADS <= HQ_A * 128):
+                        lds_st(
+                            xi,
+                            ATT_Q_OFF + ((hd // HPK) * 16 + hd % HPK) * ATT_KS + pq % 128,
+                            got[i][0],
+                        )
+                    elif pq < HQ_A * 128:
+                        lds_st(
+                            xi,
+                            ATT_Q_OFF + ((hd // HPK) * 16 + hd % HPK) * ATT_KS + pq % 128,
+                            got[i][0],
+                        )
+                if const_expr(HPK == 12):
+                    for i in range_constexpr(KVA):
+                        z = tid + i * THREADS
+                        lds_st(
+                            xi,
+                            ATT_Q_OFF
+                            + ((z // 512) * 16 + 12 + (z % 512) // 128) * ATT_KS
+                            + z % 128,
+                            fx.Int32(0),
+                        )
+                else:
+                    ZK = (16 - HPK) * 128  # zero words a kv head
+                    for i in range_constexpr((NQZ + THREADS - 1) // THREADS):
+                        z = tid + i * THREADS
+                        if z < NQZ:
+                            lds_st(
+                                xi,
+                                ATT_Q_OFF
+                                + ((z // ZK) * 16 + HPK + (z % ZK) // 128) * ATT_KS
+                                + z % 128,
+                                fx.Int32(0),
+                            )
                 if const_expr(is_blk):
                     tok = got[NQI][0] * 4 + j % 4
                     valid = si < nsel
@@ -4479,16 +4549,28 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     T.vec(4, T.f32), [a, bv, oacc]
                                 )
                             )
-                        if lane < 4 * HPK:  # rows (heads) 4 (lane // 16) + i < HPK
+                        if const_expr(HPK % 4 == 0):
+                            if lane < 4 * HPK:  # rows (heads) 4 (lane // 16) + i < HPK
+                                for i in range_constexpr(4):
+                                    put(
+                                        part,
+                                        pbase
+                                        + (kvw * HPK + 4 * (lane // 16) + i) * 256
+                                        + n0
+                                        + lane % 16,
+                                        oacc[i],
+                                    )
+                        else:
                             for i in range_constexpr(4):
-                                put(
-                                    part,
-                                    pbase
-                                    + (kvw * HPK + 4 * (lane // 16) + i) * 256
-                                    + n0
-                                    + lane % 16,
-                                    oacc[i],
-                                )
+                                if 4 * (lane // 16) + i < HPK:
+                                    put(
+                                        part,
+                                        pbase
+                                        + (kvw * HPK + 4 * (lane // 16) + i) * 256
+                                        + n0
+                                        + lane % 16,
+                                        oacc[i],
+                                    )
 
                 if const_expr(KVA == 2):
                     pvphase()

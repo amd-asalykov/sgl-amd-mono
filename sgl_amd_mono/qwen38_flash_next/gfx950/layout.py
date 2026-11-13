@@ -119,11 +119,18 @@ def gu_kphases(T):
 
 
 def gu_wsplit(T, tp=1):
-    """Waves sharing one MoE gate/up task (an in-CTA K split, partials summed in LDS).
-    TP > 1 at T <= 4: the rank's (slot, tile) tasks (at most 41 x 20) fill only 820 of
-    the 2048 waves, so two waves take K halves (one round of 20 units a wave instead
-    of 40). TP 1 (1640 tasks) and larger T: 1 (wave-level tasks)."""
-    return 2 if tp > 1 and T <= 4 and gu_kphases(T) == 1 else 1
+    """Waves sharing one MoE gate/up task (an in-CTA K split, partials summed in LDS):
+    at TP > 1 the most (4, 2) that keeps the rank's (slot, tile) tasks in one round of
+    the 2048 waves. TP 2: T <= 4 (at most 41 x 20 tasks) 2, one round of 20 units a
+    wave instead of 40; TP 4: T <= 4 (41 x 10) 4, T = 8 (81 x 10) 2. TP 1 (1640
+    tasks at T = 4) and larger T: 1 (wave-level tasks)."""
+    if tp == 1 or gu_kphases(T) != 1:
+        return 1
+    tasks = max_slots(T) * geom(tp).GU_PAIRS
+    for wk in (4, 2):
+        if tasks * wk <= BLOCKS * WAVES:
+            return wk
+    return 1
 
 
 def dn_sg(T):

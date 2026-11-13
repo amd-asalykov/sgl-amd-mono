@@ -14,8 +14,9 @@ interface is the one of RFC sgl-project/sglang#43949.
 | launches per step | 13 | 1 |
 | other steps | SGLang's forward | SGLang's forward |
 
-GPU: gfx950 (MI355X), TP 1 or 2 (attention TP = MoE TP = TP, EP 1, no DP attention; at TP 2 each rank runs its
-shard and the all-reduces run inside the kernel, see `notes/TP_PLAN.md`). Weights: the Quark checkpoint `amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`
+GPU: gfx950 (MI355X), TP 1, 2 or 4 (attention TP = MoE TP = TP, EP 1, no DP attention; at TP > 1 each rank runs
+its shard and the all-reduces run inside the kernel, see `notes/TP_PLAN.md`; at TP 4 rank pairs hold copies of
+one QSA KV head). Weights: the Quark checkpoint `amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`
 (MXFP4 experts, W8A8 FP8 attention / GDN projections, FP8 PLE n-gram table).
 
 | file | contents |
@@ -270,7 +271,7 @@ of a step grows with it. Batches above 8 requests run SGLang's forward.
 - Model: Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8
 - conc <= 8
 - NEXTN with topk = 1, 3 draft steps, 4 draft tokens
-- TP 1 or 2 (TP 4: not yet)
+- TP 1, 2 or 4 (attention TP = MoE TP = TP, EP 1, no DP attention)
 - bf16 KV cache; `triton` or `aiter` attention backend
 - contexts up to 294,848 tokens
 - with SGLang's 4-slot index-key ring, a verify row past the pending group overwrites one of its members, and a
