@@ -3883,260 +3883,284 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             put(sel, 1024, fx.Int32(512))
                         gpu.barrier()
 
-            def stage_qsa_attn(layer):
-                """Split flash-decode on MFMA: task (token t, chunk of 64 selected tokens) -> partial (o, m, l) of all
-                24 heads; waves [4 kvh, 4 kvh + 4) serve kv head kvh. Batch tokens of the row's request (pos >= pos0 of the
-                request) read K/V from kvnew."""
-                NTASK = NT * LY.ATT_TASKS
-                nloop = (NTASK - bid + G - 1) // G
-                for it, _c in range(fx.Int32(0), nloop, 1, init=[fx.Int32(0)]):
-                    it = fx.Int32(it)
-                    task = bid + it * G
-                    t = task // LY.ATT_TASKS
-                    c = task % LY.ATT_TASKS
-                    r = t // L
-                    pos0 = req_p0(r)
-                    rtt_row = rtt_row_of(r)
-                    pos = pos0 + t % L
-                    seq = pos + 1
-                    sel = mb(layer, "sel") + fx.Int64(t) * (LY.SEL_STRIDE * 8)
-                    j = tid // 8
-                    ch = tid % 8
-                    qmb = mb(layer, "q")
-                    # the selection count is min(512, nb) (single segment: min(512, nbs), nbs = nb <= 8192; merged
-                    # segments: 512 < nb) -> computed here, so q and this thread's (block, loc) share one poll round
-                    nsel = fx.min(fx.Int32(512), seq // 4)
-                    is_blk = c < LY.ATT_CHUNKS - 1
+            def attn_task(layer, t, c, task, is_blk):
+                """Split flash-decode on MFMA: task (token t, chunk c of 64 selected tokens) -> partial (o, m, l) of all
+                24 heads in part slot ``task``; waves [4 kvh, 4 kvh + 4) serve kv head kvh. Batch tokens of the row's
+                request (pos >= pos0 of the request) read K/V from kvnew. ``is_blk`` (trace time): a chunk of 16
+                selected blocks; else the tail chunk (the <= 3 tokens of the incomplete last block, c = 32)."""
+                r = t // L
+                pos0 = req_p0(r)
+                rtt_row = rtt_row_of(r)
+                pos = pos0 + t % L
+                seq = pos + 1
+                sel = mb(layer, "sel") + fx.Int64(t) * (LY.SEL_STRIDE * 8)
+                j = tid // 8
+                ch = tid % 8
+                qmb = mb(layer, "q")
+                # the selection count is min(512, nb) (single segment: min(512, nbs), nbs = nb <= 8192; merged
+                # segments: 512 < nb) -> computed here, so q and this thread's (block, loc) share one poll round
+                nsel = fx.min(fx.Int32(512), seq // 4)
+                qspec = [
+                    (qmb, t * (24 * 128) + tid + i * THREADS, 1) for i in range(6)
+                ]
+                if const_expr(is_blk):
                     si = c * 16 + j // 4
                     got = poll(
-                        [(qmb, t * (24 * 128) + tid + i * THREADS, 1) for i in range(6)]
-                        + [(sel, fx.min(si, 511) * 2, 2, is_blk & (si < nsel))]
+                        qspec + [(sel, fx.min(si, 511) * 2, 2, si < nsel)]
                     )
-                    for i in range_constexpr(6):
-                        pq = tid + i * THREADS
-                        hd = pq // 128
-                        lds_st(
-                            xi,
-                            ATT_Q_OFF + ((hd // 12) * 16 + hd % 12) * ATT_KS + pq % 128,
-                            got[i][0],
+                else:
+                    # the tail chunk does not read the selection: q only
+                    got = poll(qspec)
+                for i in range_constexpr(6):
+                    pq = tid + i * THREADS
+                    hd = pq // 128
+                    lds_st(
+                        xi,
+                        ATT_Q_OFF + ((hd // 12) * 16 + hd % 12) * ATT_KS + pq % 128,
+                        got[i][0],
+                    )
+                for i in range_constexpr(2):
+                    z = tid + i * THREADS
+                    lds_st(
+                        xi,
+                        ATT_Q_OFF
+                        + ((z // 512) * 16 + 12 + (z % 512) // 128) * ATT_KS
+                        + z % 128,
+                        fx.Int32(0),
+                    )
+                if const_expr(is_blk):
+                    tok = got[6][0] * 4 + j % 4
+                    valid = si < nsel
+                    locv = got[6][1] + j % 4
+                else:
+                    # the incomplete last block: tokens [(seq // 4) * 4, seq)
+                    tok = (seq // 4) * 4 + j
+                    valid = tok < seq
+                    locv = rtt_at(rtt_row, fx.min(tok, seq - 1))
+                tokc = fx.min(fx.max(tok, fx.Int32(0)), seq - 1)
+                # thread ch holds the 16 B chunks ch + 8 q (dims 8 (ch + 8 q) .. + 8) of its K/V rows; 64-bit
+                # addresses: the KV pools may exceed 4 GB
+                rowk = ptr(layer, LY.P_KBUF) + fx.Int64(locv) * 1024
+                rowv = ptr(layer, LY.P_VBUF) + fx.Int64(locv) * 1024
+                kw = [
+                    [
+                        fx.Vector(
+                            global_load(rowk + (kvh * 512 + (ch + 8 * q) * 16), 4)
                         )
-                    for i in range_constexpr(2):
-                        z = tid + i * THREADS
-                        lds_st(
-                            xi,
-                            ATT_Q_OFF
-                            + ((z // 512) * 16 + 12 + (z % 512) // 128) * ATT_KS
-                            + z % 128,
-                            fx.Int32(0),
+                        for q in range(4)
+                    ]
+                    for kvh in range(2)
+                ]
+                vw = [
+                    [
+                        fx.Vector(
+                            global_load(rowv + (kvh * 512 + (ch + 8 * q) * 16), 4)
                         )
-                    tail_start = (seq // 4) * 4
-                    blk = got[6][0]
-                    locb = got[6][1]
-                    tok_t = tail_start + j
-                    tok = is_blk.select(blk * 4 + j % 4, tok_t)
-                    valid = is_blk.select(si < nsel, tok_t < seq)
-                    tokc = fx.min(fx.max(tok, fx.Int32(0)), seq - 1)
-                    loc_t = rtt_at(rtt_row, fx.min(tok_t, seq - 1))
-                    locv = is_blk.select(locb + j % 4, loc_t)
-                    # thread ch holds the 16 B chunks ch + 8 q (dims 8 (ch + 8 q) .. + 8) of its K/V rows; 64-bit
-                    # addresses: the KV pools may exceed 4 GB
-                    rowk = ptr(layer, LY.P_KBUF) + fx.Int64(locv) * 1024
-                    rowv = ptr(layer, LY.P_VBUF) + fx.Int64(locv) * 1024
-                    kw = [
-                        [
-                            fx.Vector(
-                                global_load(rowk + (kvh * 512 + (ch + 8 * q) * 16), 4)
-                            )
-                            for q in range(4)
-                        ]
-                        for kvh in range(2)
+                        for q in range(4)
                     ]
-                    vw = [
-                        [
-                            fx.Vector(
-                                global_load(rowv + (kvh * 512 + (ch + 8 * q) * 16), 4)
-                            )
-                            for q in range(4)
-                        ]
-                        for kvh in range(2)
-                    ]
-                    if valid & (tokc >= pos0):
-                        kvnew = mb(layer, "kvnew")
-                        tb = r * L + tokc - pos0
-                        for kvh in range_constexpr(2):
-                            kn = poll(
-                                [
-                                    (
-                                        kvnew,
-                                        tb * 512
-                                        + kvh * 128
-                                        + (ch + 8 * q) * 4
-                                        + 2 * hf,
-                                        2,
-                                    )
-                                    for q in range(4)
-                                    for hf in range(2)
-                                ]
-                            )
-                            vn = poll(
-                                [
-                                    (
-                                        kvnew,
-                                        tb * 512
-                                        + 256
-                                        + kvh * 128
-                                        + (ch + 8 * q) * 4
-                                        + 2 * hf,
-                                        2,
-                                    )
-                                    for q in range(4)
-                                    for hf in range(2)
-                                ]
-                            )
-                            kw[kvh] = [
-                                fx.Vector.from_elements(
-                                    kn[2 * q] + kn[2 * q + 1], fx.Int32
-                                )
-                                for q in range(4)
-                            ]
-                            vw[kvh] = [
-                                fx.Vector.from_elements(
-                                    vn[2 * q] + vn[2 * q + 1], fx.Int32
-                                )
-                                for q in range(4)
-                            ]
+                    for kvh in range(2)
+                ]
+                if valid & (tokc >= pos0):
+                    kvnew = mb(layer, "kvnew")
+                    tb = r * L + tokc - pos0
                     for kvh in range_constexpr(2):
-                        for q in range_constexpr(4):
-                            for e in range_constexpr(4):
-                                lds_st(
-                                    xi,
-                                    ATT_OFF
-                                    + kvh * ATT_KV_WORDS
-                                    + j * ATT_KS
+                        kn = poll(
+                            [
+                                (
+                                    kvnew,
+                                    tb * 512
+                                    + kvh * 128
                                     + (ch + 8 * q) * 4
-                                    + e,
-                                    kw[kvh][q][e],
+                                    + 2 * hf,
+                                    2,
                                 )
-                    if ch == 0:
-                        lds_st(
-                            xi,
-                            ATT_M_OFF + 64 + j,
-                            valid.select(fx.Int32(1), fx.Int32(0)),
+                                for q in range(4)
+                                for hf in range(2)
+                            ]
                         )
-                    gpu.barrier()
-                    # ---- S = Q K^T (MFMA): wave -> (kv head, 16-token tile), full 256 dims
-                    kvw = wave // 4
-                    nt_ = wave % 4
-                    cacc = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for ks in range_constexpr(8):
-                        dw = ks * 16 + (lane // 16) * 4
+                        vn = poll(
+                            [
+                                (
+                                    kvnew,
+                                    tb * 512
+                                    + 256
+                                    + kvh * 128
+                                    + (ch + 8 * q) * 4
+                                    + 2 * hf,
+                                    2,
+                                )
+                                for q in range(4)
+                                for hf in range(2)
+                            ]
+                        )
+                        kw[kvh] = [
+                            fx.Vector.from_elements(
+                                kn[2 * q] + kn[2 * q + 1], fx.Int32
+                            )
+                            for q in range(4)
+                        ]
+                        vw[kvh] = [
+                            fx.Vector.from_elements(
+                                vn[2 * q] + vn[2 * q + 1], fx.Int32
+                            )
+                            for q in range(4)
+                        ]
+                for kvh in range_constexpr(2):
+                    for q in range_constexpr(4):
+                        for e in range_constexpr(4):
+                            lds_st(
+                                xi,
+                                ATT_OFF
+                                + kvh * ATT_KV_WORDS
+                                + j * ATT_KS
+                                + (ch + 8 * q) * 4
+                                + e,
+                                kw[kvh][q][e],
+                            )
+                if ch == 0:
+                    lds_st(
+                        xi,
+                        ATT_M_OFF + 64 + j,
+                        valid.select(fx.Int32(1), fx.Int32(0)),
+                    )
+                gpu.barrier()
+                # ---- S = Q K^T (MFMA): wave -> (kv head, 16-token tile), full 256 dims
+                kvw = wave // 4
+                nt_ = wave % 4
+                cacc = fx.Vector.filled(4, 0.0, fx.Float32)
+                for ks in range_constexpr(8):
+                    dw = ks * 16 + (lane // 16) * 4
+                    a = fx.ptr_load(
+                        xs + (ATT_Q_OFF + (kvw * 16 + lane % 16) * ATT_KS + dw),
+                        result_type=v4f,
+                    ).bitcast(fx.BFloat16)
+                    bk = fx.ptr_load(
+                        xs
+                        + (
+                            ATT_OFF
+                            + kvw * ATT_KV_WORDS
+                            + (nt_ * 16 + lane % 16) * ATT_KS
+                            + dw
+                        ),
+                        result_type=v4f,
+                    ).bitcast(fx.BFloat16)
+                    cacc = fx.Vector(
+                        rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, bk, cacc])
+                    )
+                for i in range_constexpr(4):
+                    lds_st(
+                        xs,
+                        ATT_S_OFF
+                        + kvw * 1024
+                        + (4 * (lane // 16) + i) * 64
+                        + nt_ * 16
+                        + lane % 16,
+                        cacc[i],
+                    )
+                gpu.barrier()
+                # ---- V^T into the K regions (K is dead), softmax of the 2 x 16 (padded) head rows -> P (bf16)
+                for kvh in range_constexpr(2):
+                    for q in range_constexpr(4):
+                        vv = vw[kvh][q].bitcast(fx.BFloat16)
+                        for e in range_constexpr(8):
+                            fx.ptr_store(
+                                vv[e],
+                                xb
+                                + (
+                                    (ATT_OFF + kvh * ATT_KV_WORDS) * 2
+                                    + ((ch + 8 * q) * 8 + e) * ATT_VS
+                                    + j
+                                ),
+                            )
+                okv = lds_ld(xi, ATT_M_OFF + 64 + lane) != 0
+                for r in range_constexpr(4):
+                    row = wave + 8 * r  # (kvh, head) row: kvh = row // 16
+                    hl = row % 16
+                    sv = lds_ld(xs, ATT_S_OFF + row * 64 + lane) * (1.0 / 16.0)
+                    live = okv & (hl < 12)
+                    sv = live.select(sv, fx.Float32(NEG_INF))
+                    mx = sv
+                    for off in (32, 16, 8, 4, 2, 1):
+                        mx = _xred(mx, off, fx.max)
+                    pv = live.select(_exp(sv - mx), fx.Float32(0.0))
+                    sm = wave_sum(pv)
+                    fx.ptr_store(
+                        pv.to(fx.BFloat16),
+                        xb + (ATT_P_OFF * 2 + row * ATT_VS + lane),
+                    )
+                    if (lane == 0) & (hl < 12):
+                        hh = (row // 16) * 12 + hl
+                        lds_st(xs, ATT_M_OFF + hh, mx)
+                        lds_st(xs, ATT_M_OFF + 24 + hh, sm)
+                gpu.barrier()
+                # ---- O = P V (MFMA): wave -> (kv head, 64 dims)
+                part = mb(layer, "part")
+                pbase = task * LY.PART_STRIDE
+                for t2 in range_constexpr(4):
+                    n0 = nt_ * 64 + t2 * 16
+                    oacc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for ks in range_constexpr(2):
+                        ke = ks * 32 + (lane // 16) * 8
                         a = fx.ptr_load(
-                            xs + (ATT_Q_OFF + (kvw * 16 + lane % 16) * ATT_KS + dw),
+                            xs
+                            + (
+                                ATT_P_OFF
+                                + ((kvw * 16 + lane % 16) * ATT_VS + ke) // 2
+                            ),
                             result_type=v4f,
                         ).bitcast(fx.BFloat16)
-                        bk = fx.ptr_load(
+                        bv = fx.ptr_load(
                             xs
                             + (
                                 ATT_OFF
                                 + kvw * ATT_KV_WORDS
-                                + (nt_ * 16 + lane % 16) * ATT_KS
-                                + dw
+                                + ((n0 + lane % 16) * ATT_VS + ke) // 2
                             ),
                             result_type=v4f,
                         ).bitcast(fx.BFloat16)
-                        cacc = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, bk, cacc])
-                        )
-                    for i in range_constexpr(4):
-                        lds_st(
-                            xs,
-                            ATT_S_OFF
-                            + kvw * 1024
-                            + (4 * (lane // 16) + i) * 64
-                            + nt_ * 16
-                            + lane % 16,
-                            cacc[i],
-                        )
-                    gpu.barrier()
-                    # ---- V^T into the K regions (K is dead), softmax of the 2 x 16 (padded) head rows -> P (bf16)
-                    for kvh in range_constexpr(2):
-                        for q in range_constexpr(4):
-                            vv = vw[kvh][q].bitcast(fx.BFloat16)
-                            for e in range_constexpr(8):
-                                fx.ptr_store(
-                                    vv[e],
-                                    xb
-                                    + (
-                                        (ATT_OFF + kvh * ATT_KV_WORDS) * 2
-                                        + ((ch + 8 * q) * 8 + e) * ATT_VS
-                                        + j
-                                    ),
-                                )
-                    okv = lds_ld(xi, ATT_M_OFF + 64 + lane) != 0
-                    for r in range_constexpr(4):
-                        row = wave + 8 * r  # (kvh, head) row: kvh = row // 16
-                        hl = row % 16
-                        sv = lds_ld(xs, ATT_S_OFF + row * 64 + lane) * (1.0 / 16.0)
-                        live = okv & (hl < 12)
-                        sv = live.select(sv, fx.Float32(NEG_INF))
-                        mx = sv
-                        for off in (32, 16, 8, 4, 2, 1):
-                            mx = _xred(mx, off, fx.max)
-                        pv = live.select(_exp(sv - mx), fx.Float32(0.0))
-                        sm = wave_sum(pv)
-                        fx.ptr_store(
-                            pv.to(fx.BFloat16),
-                            xb + (ATT_P_OFF * 2 + row * ATT_VS + lane),
-                        )
-                        if (lane == 0) & (hl < 12):
-                            hh = (row // 16) * 12 + hl
-                            lds_st(xs, ATT_M_OFF + hh, mx)
-                            lds_st(xs, ATT_M_OFF + 24 + hh, sm)
-                    gpu.barrier()
-                    # ---- O = P V (MFMA): wave -> (kv head, 64 dims)
-                    part = mb(layer, "part")
-                    pbase = task * LY.PART_STRIDE
-                    for t2 in range_constexpr(4):
-                        n0 = nt_ * 64 + t2 * 16
-                        oacc = fx.Vector.filled(4, 0.0, fx.Float32)
-                        for ks in range_constexpr(2):
-                            ke = ks * 32 + (lane // 16) * 8
-                            a = fx.ptr_load(
-                                xs
-                                + (
-                                    ATT_P_OFF
-                                    + ((kvw * 16 + lane % 16) * ATT_VS + ke) // 2
-                                ),
-                                result_type=v4f,
-                            ).bitcast(fx.BFloat16)
-                            bv = fx.ptr_load(
-                                xs
-                                + (
-                                    ATT_OFF
-                                    + kvw * ATT_KV_WORDS
-                                    + ((n0 + lane % 16) * ATT_VS + ke) // 2
-                                ),
-                                result_type=v4f,
-                            ).bitcast(fx.BFloat16)
-                            oacc = fx.Vector(
-                                rocdl.mfma_f32_16x16x32_bf16(
-                                    T.vec(4, T.f32), [a, bv, oacc]
-                                )
+                        oacc = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(
+                                T.vec(4, T.f32), [a, bv, oacc]
                             )
-                        if lane < 48:  # rows (heads) 4 (lane // 16) + i < 12
-                            for i in range_constexpr(4):
-                                put(
-                                    part,
-                                    pbase
-                                    + (kvw * 12 + 4 * (lane // 16) + i) * 256
-                                    + n0
-                                    + lane % 16,
-                                    oacc[i],
-                                )
-                    if tid < 48:
-                        put(part, pbase + 24 * 256 + tid, lds_ld(xs, ATT_M_OFF + tid))
-                    gpu.barrier()
+                        )
+                    if lane < 48:  # rows (heads) 4 (lane // 16) + i < 12
+                        for i in range_constexpr(4):
+                            put(
+                                part,
+                                pbase
+                                + (kvw * 12 + 4 * (lane // 16) + i) * 256
+                                + n0
+                                + lane % 16,
+                                oacc[i],
+                            )
+                if tid < 48:
+                    put(part, pbase + 24 * 256 + tid, lds_ld(xs, ATT_M_OFF + tid))
+                gpu.barrier()
+
+            def stage_qsa_attn(layer):
+                """The 32 block chunks of every token (task (t, c) -> part slot t * ATT_TASKS + c)."""
+                NTASK = NT * LY.ATT_BLK_TASKS
+                nloop = (NTASK - bid + G - 1) // G
+                for it, _c in range(fx.Int32(0), nloop, 1, init=[fx.Int32(0)]):
+                    it = fx.Int32(it)
+                    task = bid + it * G
+                    t = task // LY.ATT_BLK_TASKS
+                    c = task % LY.ATT_BLK_TASKS
+                    attn_task(layer, t, c, t * LY.ATT_TASKS + c, True)
                     _ = yield [fx.Int32(0)]
+
+            def stage_qsa_tail(layer):
+                """The tail chunk of token t (part slot t * ATT_TASKS + 32) on CTA tail_base + t: it needs only q and
+                kvnew / the KV cache (prep), not the selection, so it runs while scores and select run elsewhere."""
+                tt = placed(LY.tail_base(R, NT))
+                if tt < NT:
+                    attn_task(
+                        layer,
+                        tt,
+                        LY.ATT_BLK_TASKS,
+                        tt * LY.ATT_TASKS + LY.ATT_BLK_TASKS,
+                        False,
+                    )
 
             def stage_qsa_merge(layer):
                 """Task (token, head): combine the chunk partials, sigmoid gate -> og."""
@@ -4984,6 +5008,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     wave = tid // 64
                     stage_qsa_prep(li)
                     mark(f"{li}.qsa_prep")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_tail(li)
+                    mark(f"{li}.qsa_tail")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64

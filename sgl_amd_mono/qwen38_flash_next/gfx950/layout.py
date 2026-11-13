@@ -123,6 +123,7 @@ MAX_CTX = MAX_BLOCKS * 4  # 294912 >= max_position_embeddings (262144) + verify 
 ATT_CHUNK = 64  # tokens per attention split
 ATT_CHUNKS = 2048 // ATT_CHUNK + 1  # 32 block chunks + 1 tail chunk
 ATT_TASKS = ATT_CHUNKS  # per token; one task covers both kv heads
+ATT_BLK_TASKS = ATT_CHUNKS - 1  # the block chunks (stage qsa_attn); the tail chunk runs in qsa_tail
 PART_STRIDE = 24 * 256 + 2 * 24  # per task: o[24][256], m[24], l[24]
 MERGE_TASKS = 24  # one per (token, head)
 PREP_Q_TASKS = 24  # CTAs [0, 24): one attention q head each (all tokens)
@@ -160,6 +161,40 @@ SCORES_BASE = PREP_BASE + PREP_IDX_CTA0 + 8  # + MAX_R
 def sel2_cta0(T):
     """CTAs [256 - T, 256): merge of the segment top-512s of row t (long contexts)."""
     return 256 - T
+
+
+def _tail_ctas(base, T):
+    return {(base + t) % 256 for t in range(T)}
+
+
+def scores_ctas(R):
+    """CTAs of the index scores at an ~8k context: 2048 + 1 compressed blocks -> 129 tiles of 16 per request,
+    8 tiles per CTA (the 129th, the newest block, gates the select of the request's last rows)."""
+    return (R * (2048 // 16 + 1) + 7) // 8
+
+
+def tail_base(R, T):
+    """QSA attention tail chunk of row t on CTA tail_base + t (stage qsa_tail): past the index scores' CTAs, or,
+    if that reaches the select CTAs, just below the prep CTAs. Placement only: the tail polls prep outputs
+    alone, so any CTA range is deadlock-free."""
+    base = (SCORES_BASE + scores_ctas(R)) % 256
+    if _tail_ctas(base, T) & set(range(sel2_cta0(T), 256)):
+        base = PREP_BASE - T
+    return base
+
+
+def _check_tail_base():
+    for R in range(1, 9):
+        for L in range(1, 32 // R + 1):
+            T = R * L
+            tail = _tail_ctas(tail_base(R, T), T)
+            prep = {(PREP_BASE + k) % 256 for k in range(PREP_IDX_CTA0 + R)}
+            scores = {(SCORES_BASE + k) % 256 for k in range(scores_ctas(R))}
+            sel = set(range(sel2_cta0(T), 256))
+            assert not tail & (prep | scores | sel), (R, L)
+
+
+_check_tail_base()
 
 
 SEL_STRIDE = 1026  # pairs per token: (block, loc) as 2 pairs each, count at pair 1024
