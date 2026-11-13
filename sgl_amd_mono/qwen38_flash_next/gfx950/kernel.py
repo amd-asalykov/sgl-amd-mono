@@ -1225,6 +1225,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 (ks_d * NT + t) * 4 + b,
                                 red_rows(0, WAVES, b, t),
                             )
+                mark(f"{layer}.mix{hc}_dn")
                 # ---- up + branch mean: task u covers outputs [16u, 16u+16) of all 4 branches, all tokens
                 NKC_U = HC_LOWRANK // 64
                 utask = placed(base + LY.MIX_DOWN_TASKS)
@@ -2999,6 +3000,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         elem0=kh * (HIDDEN // 2),
                     )
                 route(layer)
+                mark(f"{layer}.gu_route")
                 gu = ptr(layer, LY.P_GU)
                 gus = ptr(layer, LY.P_GU_S)
                 mid = mb(layer, "mid")
@@ -3206,6 +3208,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 lds_st(xi, o + 1, hw[n_][1])
                         _ = yield [fx.Int32(0)]
                 gpu.barrier()
+                mark(f"{layer}.dn_stage")
                 # wave-level row-group tasks: wave w of CTA jj takes rg = jj * 8 + w + k * cpg * 8 (all of the group's K)
                 jw = jj * WAVES + wave
                 nrg = live_g.select(
@@ -3281,6 +3284,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                     _ = yield [fx.Int32(0)]
                 gpu.barrier()
+                mark(f"{layer}.dn_mma")
                 if bid < LY.DN_RG:
                     rg = bid
                     # sum the group partials of rows [16 rg, 16 rg + 16) for all rows -> LDS MOE_OUTS[t][16]
