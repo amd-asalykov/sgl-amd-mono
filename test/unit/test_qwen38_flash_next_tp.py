@@ -113,6 +113,38 @@ def test_scratch_layout_tp(T, R):
             assert sizes[f"L0.{name}"] == ref[f"L0.{name}"], name
 
 
+@pytest.mark.parametrize("tp", [1, 2, 4])
+@pytest.mark.parametrize("T,R", [(4, 1), (8, 2), (16, 4), (32, 8)])
+def test_scratch_holds_the_rank_stages(tp, T, R):
+    """Every per-rank mailbox holds what its producer writes: the GDN core's per (row, task)
+    (ssq, max |og|) pairs (2 a task under the out_proj gated norm), og [S][VAL_DIM], q / kvnew of
+    the rank's heads, mid [pairs][I]."""
+    g = LY.geom(tp)
+    sizes = _sizes(*LY.scratch_layout(6, T, R, tp))
+    tasks = g.HV * LY.core_split(T, tp)
+    assert tasks == 192
+    assert sizes["L0.og_amax"] >= T * 2 * tasks * 8 and sizes["L0.ssq"] >= T * tasks * 8
+    assert sizes["L0.og"] >= T * g.VAL_DIM // 2 * 8 and g.VAL_DIM == g.HQ * 256
+    assert sizes["L0.q"] >= T * g.HQ * 128 * 8 and sizes["L0.kvnew"] >= T * g.KV * 256 * 8
+    assert sizes["L0.mid"] >= LY.MOE_PAIR * T * g.MOE_INTER // 2 * 8
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_tail_base_at_tp(tp):
+    """The QSA attention tail chunks sit off the rank's prep, index-score and select CTAs; TP 1
+    is unchanged."""
+    g = LY.geom(tp)
+    for R in range(1, 9):
+        for L in range(1, 32 // R + 1):
+            T = R * L
+            tail = {(LY.tail_base(R, T, tp) + t) % 256 for t in range(T)}
+            prep = {(g.PREP_BASE + k) % 256 for k in range(g.PREP_IDX_CTA0 + R)}
+            scores = {(g.SCORES_BASE + k) % 256 for k in range(LY.scores_ctas(R))}
+            assert not tail & (prep | scores | set(range(LY.sel2_cta0(T), 256)))
+            if tp == 1:
+                assert LY.tail_base(R, T, 1) == LY.tail_base(R, T)
+
+
 def _sizes(regions, total):
     names = sorted(regions, key=regions.get)
     ends = [regions[n] for n in names[1:]] + [total]

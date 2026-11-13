@@ -90,16 +90,12 @@ from . import layout as LY
 from .config import (
     EPS,
     GDN_DK,
-    GDN_HV,
-    GDN_KEY_DIM,
-    GDN_VAL_DIM,
     HC,
     HC_DIM,
     HC_LOWRANK,
     HIDDEN,
     MAX_R,
     MAX_T,
-    MOE_INTER,
     N_EXPERTS,
     TOPK,
     MonoBuild,
@@ -222,11 +218,16 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     issm_row, ple_ist_row, ictx_row = key.issm_row, key.ple_ist_row, key.ictx_row
     iconv_strides = (key.iconv.step, key.iconv.channel, key.iconv.window, key.iconv.row)
     fault_site, fault_after = key.fault_site, key.fault_after
-    # TP: the rank's shard geometry (``layout.geom``); the rank is a kernel argument.
-    # The stages still run the TP 1 shapes (the sharded stages are TP_PLAN commit 4),
-    # so a TP > 1 build serves the plumbing (compile) tests only: the runners refuse
-    # to launch it.
+    # TP: the rank's shard geometry (``layout.geom``; GM: GDN heads, QSA q heads / KV
+    # head, MoE intermediate of the rank); the rank is a kernel argument. The
+    # replicated stages (mixers, router, indexer, PLE, prelude) keep the module
+    # constants.
     TPW = key.tp
+    GM = LY.geom(TPW)
+    if TPW > 2:
+        # TP 4 needs a 64-K out_proj unit (12 chunks over 8 waves), a 2 K-words a thread
+        # GDN core (core_split 16) and 6 q heads an attention task (TP_PLAN commit 9)
+        raise NotImplementedError(f"Qwen3.8-Flash-Next monokernel: TP {TPW} stages")
     R, L = nreq, ntok
     NT = R * L
     assert 1 <= R <= MAX_R and 1 <= NT <= MAX_T
@@ -251,13 +252,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     NORM_IN_OP = NT <= 8
     # OP_KS: out_proj K parts staged one after the other (og [S][6144 / OP_KS]; S = 32:
     # three parts keep the weights in registers); OG_BATCH: og polls per round
+    # (TP 2: K = 3072, one part: 3 chunks a wave, as TP 1's two-part S = 16)
     if QB:
-        OP_KS = 1 if NT <= 8 else 2
-        S_OG = act_stride(GDN_VAL_DIM // OP_KS)
+        OP_KS = 1 if NT <= 8 or TPW > 1 else 2
+        S_OG = act_stride(GM.VAL_DIM // OP_KS)
         OG_BATCH = 12  # next to the out_proj weight vectors, no spills
     else:
-        OP_KS = 1 if NT <= 16 else 3
-        S_OG = act_stride8(GDN_VAL_DIM // OP_KS)
+        OP_KS = 1 if NT <= 16 or TPW > 1 else 3
+        S_OG = act_stride8(GM.VAL_DIM // OP_KS)
         OG_BATCH = 24 if NT <= 4 else (12 if NT <= 16 else 8)
     # in_proj / QSA proj: activation polls per round, and weight tiles in flight
     # (issued before the activation is staged)
@@ -266,13 +268,19 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     S_HNS = act_stride(1024)  # [S][1024] Hn K-slice of a mix
     S_TACT = act_stride(HC_LOWRANK)  # [S][320]
     SG = LY.dn_sg(NT)  # expert slots per down K-group
-    S_MID = act_stride(SG * MOE_INTER)  # [S][SG * 640]
+    # MoE down K of a slot (the rank's intermediate, TP 1 640): KT_FULL whole 128-K
+    # MXFP4 chunks + a DN_TAIL-K tail chunk (TP 2: 64; MXFP4 groups are 32-K)
+    MI = GM.MOE_INTER
+    KT_FULL, DN_TAIL = MI // 128, MI % 128
+    # [S][SG * I] (+ 16 zero words a row at TP: the B operand of the tail chunk's
+    # unused K lanes, so they never read past the real K)
+    S_MID = act_stride(SG * MI) + (16 if DN_TAIL else 0)
     NS_MAX = LY.max_slots(NT)
     NPAIR = LY.MOE_PAIR  # (row, expert) pairs per row
     CN = LY.cnew_slots(L)
     IC_STEP, IC_DIM, IC_WIN, IC_ROW = iconv_strides
-    CSPLIT = LY.core_split(NT)
-    C_ROWS, C_TASKS, C_RPT, C_KPT, C_RED = LY.core_geom(CSPLIT)
+    CSPLIT = LY.core_split(NT, TPW)
+    C_ROWS, C_TASKS, C_RPT, C_KPT, C_RED = LY.core_geom(CSPLIT, GM.HV)
     RED_SLOT = WAVES * 64 * 4  # words of one (tile, column tile) accumulator slot
     KPG = LY.gu_kphases(NT)  # K phases (CTA halves) of the MoE gate/up
     S_GU = act_stride(HIDDEN // KPG)  # [S][2560 / KPG] gate/up activation rows
@@ -315,9 +323,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     OUTS = W0  # small per-stage outputs ([S][16] words, merge scratch) after the GEMM (ACT dead)
     ACT = W0 + 256
     assert ACT + NT * S_OG <= TAIL_OFF, "out_proj activation does not fit LDS"
-    # GDN out_proj: [S][48] per (row, head) gated-RMS rstd x 448 / row amax (the og FP8 quantization factor)
+    # GDN out_proj: [S][HV] per (row, head) gated-RMS rstd x 448 / row amax (the og FP8 quantization factor)
     OPINV = ACT + NT * S_OG
-    assert OPINV + NT * GDN_HV <= TAIL_OFF
+    assert OPINV + NT * GM.HV <= TAIL_OFF
     assert ACT + NT * S_ACT <= TAIL_OFF
     # MoE (wave-level tasks, no accumulator exchange): small outputs at 0, then the gate/up activation (live with
     # the route tables) / the staged mid of a down group
@@ -636,17 +644,23 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                 )
 
-            def unit_mxfp4a(w_rsrc, s_rsrc, rg, kc, K, b_word, coef=None, sdw=None):
+            def unit_mxfp4a(
+                w_rsrc, s_rsrc, rg, kc, K, b_word, coef=None, sdw=None, kmask=None
+            ):
                 """16 rows x 128 K (chunk kc) of an expert matrix in SGLang's AITER MXFP4 layout. Weights
                 (shuffle_weight (16, 16)): the tile's 1 KB is contiguous, lane l = row l % 16, K [32 (l / 16), +32) as 4
                 words of 8 values; the MFMA K32 step s takes word s, so step s / lane group j covers K 32 j + 8 s + e (the
                 B operand from bcolq, + 4 words per step). Scales (e8m0_shuffle, 32-row x 8-group blocks, byte
                 ((((a D + kc / 2) 4 + j) 16 + c) 2 + kc % 2) 2 + b for expert row 32 a + 16 b + c, group 4 kc + j): one
-                scale per lane and chunk (group 4 kc + j)."""
+                scale per lane and chunk (group 4 kc + j). kmask (a tail chunk): lanes where it is false load
+                nothing (an offset past the descriptor's range reads zeros) and their B operand must be zeros."""
+                woff = ((rg * (K // 128) + kc) * 64 + lane) * 4
+                if const_expr(kmask is not None):
+                    woff = kmask.select(woff, fx.Int32(1 << 28))
                 raw = fx.Vector(
                     bo.buffer_load(
                         w_rsrc,
-                        ((rg * (K // 128) + kc) * 64 + lane) * 4,
+                        woff,
                         vec_width=4,
                         dtype=T.i32,
                         cache_modifier=W_CM_MOE,
@@ -1327,7 +1341,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 """dst[t, b*HIDDEN + 16 rg + r] = H + block_out[t, 16 rg + r] * gate[t, b], the combine gate
                 2 sigmoid(Hn[t] . Winj_b / HC) from the mix's per-slice partials (tid < 32 T); plus the per-(t, b)
                 sum-of-squares partial rg of the new stream. block_val(p, t) -> (v0, v1). pre: the polled
-                combine_pre(...) values (else polled here)."""
+                combine_pre(...) values (else polled here). TP > 1: block_val is this rank's partial (its all-reduce is
+                TP_PLAN commit 5; the runners do not launch TP > 1 yet)."""
                 NQ = 32 * NT
                 for i in range_constexpr((NQ + THREADS - 1) // THREADS):
                     q = tid + i * THREADS
@@ -1757,9 +1772,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     lambda: stage_act8(mb(layer, "a.mixx")),
                     _rsrc(ptr(layer, LY.P_IP)),
                     _rsrc(ptr(layer, LY.P_IP_S)),
-                    LY.IP_RG_MAIN // G,
+                    GM.IP_RG_MAIN // G,
                     lambda i: bid + i * G,
-                    emit8_bf_rows(mb(layer, "ip"), LY.IP_ROWS // 2),
+                    emit8_bf_rows(mb(layer, "ip"), GM.IP_ROWS // 2),
                 )
 
             # ---- GDN: conv + recurrence over the T tokens
@@ -1775,7 +1790,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 bc = fx.min(bid, C_TASKS - 1)
                 h = bc // CSPLIT
                 s = bc % CSPLIT
-                kh = h // (GDN_HV // (GDN_KEY_DIM // GDN_DK))
+                kh = h // (GM.HV // GM.HK)
                 RPT, KPT, ROWS = C_RPT, C_KPT, C_ROWS
                 j = tid // RPT
                 c = tid % RPT
@@ -1783,7 +1798,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 msl = [_uniform(lds_ld(xi, RQ_MS + r_)) for r_ in range(R)]
                 sts = []
                 # bytes per mamba slot
-                SSB = LY.SSM_SLOT_BYTES // 2 if ssm_bf16 else LY.SSM_SLOT_BYTES
+                SSB = GM.SSM_SLOT_BYTES // 2 if ssm_bf16 else GM.SSM_SLOT_BYTES
                 for r_ in range_constexpr(R):
                     r_ssm = rsrc_if(
                         ptr(layer, LY.P_SSM_STATE) + fx.Int64(msl[r_]) * SSB,
@@ -1825,8 +1840,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 ch = (tc < 128).select(
                     kh * GDN_DK + tc,
                     (tc < 256).select(
-                        GDN_KEY_DIM + kh * GDN_DK + (tc - 128),
-                        2 * GDN_KEY_DIM + h * GDN_DK + s * ROWS + (tc - 256),
+                        GM.KEY_DIM + kh * GDN_DK + (tc - 128),
+                        2 * GM.KEY_DIM + h * GDN_DK + s * ROWS + (tc - 256),
                     ),
                 )
                 cw = (
@@ -1838,7 +1853,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 for r_ in range_constexpr(R):
                     r_cs = _rsrc(
                         ptr(layer, LY.P_CONV_STATE)
-                        + fx.Int64(msl[r_]) * LY.CONV_SLOT_BYTES
+                        + fx.Int64(msl[r_]) * GM.CONV_SLOT_BYTES
                     )
                     cst.append(
                         [
@@ -1853,12 +1868,12 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ]
                     )
                 # b/a rows of head h (row-major FP8) -> LDS C_BA [2][2560] FP8 (640 words per row) + their scales
-                r_ba = rsrc_if(ptr(layer, LY.P_BA), is_core, LY.BA_ROWS * HIDDEN)
+                r_ba = rsrc_if(ptr(layer, LY.P_BA), is_core, GM.BA_ROWS * HIDDEN)
                 NW_BA = HIDDEN // 4  # words per row
                 bav = []
                 for i in range_constexpr((2 * NW_BA + THREADS - 1) // THREADS):
                     q = fx.min(tid + i * THREADS, 2 * NW_BA - 1)
-                    hr = (q < NW_BA).select(h, GDN_HV + h)
+                    hr = (q < NW_BA).select(h, GM.HV + h)
                     # K bytes 4 w_ .. of row hr in SGLang's AITER-shuffled in_proj_ba (16 x 32-byte pieces)
                     w_ = q % NW_BA
                     wa = (
@@ -1878,7 +1893,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 r_bas = _rsrc(ptr(layer, LY.P_BA_S))
                 sb = fx.Float32(bo.buffer_load(r_bas, h, vec_width=1, dtype=T.f32))
                 sa = fx.Float32(
-                    bo.buffer_load(r_bas, GDN_HV + h, vec_width=1, dtype=T.f32)
+                    bo.buffer_load(r_bas, GM.HV + h, vec_width=1, dtype=T.f32)
                 )
                 # q/k channels are shared by the 12 tasks of a k head: (h % 3 == 0, s == 0) writes their windows
                 own = (tid >= 256) | ((h % 3 == 0) & (s == 0))
@@ -1897,7 +1912,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     if tid < NCH:
                         xw = poll(
                             [
-                                (ip, t * (LY.IP_ROWS // 2) + ch // 2, 1)
+                                (ip, t * (GM.IP_ROWS // 2) + ch // 2, 1)
                                 for t in range(NT)
                             ]
                         )
@@ -1930,15 +1945,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     )
                     if (tid >= NCH) & (tid < NCH + ROWS):
                         zr = (
-                            GDN_KEY_DIM * 2
-                            + GDN_VAL_DIM
+                            GM.KEY_DIM * 2
+                            + GM.VAL_DIM
                             + h * GDN_DK
                             + s * ROWS
                             + (tid - NCH)
                         )
                         zw = poll(
                             [
-                                (ip, t * (LY.IP_ROWS // 2) + zr // 2, 1)
+                                (ip, t * (GM.IP_ROWS // 2) + zr // 2, 1)
                                 for t in range(NT)
                             ]
                         )
@@ -2084,7 +2099,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                             off = (
                                 r_ * issm_row
-                                + j_ * LY.SSM_STEP_WORDS
+                                + j_ * GM.SSM_STEP_WORDS
                                 + srow
                                 + 4 * q
                             )
@@ -2174,7 +2189,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 if (lane < ROWS) & (lane % 2 == 0):
                                     put_bf(
                                         mb(layer, "og"),
-                                        t * (GDN_VAL_DIM // 2)
+                                        t * (GM.VAL_DIM // 2)
                                         + (h * GDN_DK + s * ROWS + lane) // 2,
                                         og,
                                         nb_,
@@ -2233,7 +2248,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 if (lane < ROWS) & (lane % 2 == 0):
                                     put_bf(
                                         mb(layer, "og"),
-                                        t * (GDN_VAL_DIM // 2)
+                                        t * (GM.VAL_DIM // 2)
                                         + (h * GDN_DK + s * ROWS + lane) // 2,
                                         og,
                                         nb_,
@@ -2248,14 +2263,16 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 merged attention output) is quantized per row with the scale from the producers' max |og| partials;
                 output = acc x weight row scale x activation scale. GDN under NORM_IN_OP: og arrives un-normalized and is
                 quantized with the per (row, head) factor OPINV = rstd x 448 / amax(normalized row)."""
-                optask = placed(LY.op_base(kind, NT))
+                optask = placed(LY.op_base(kind, NT, TPW))
                 is_op = optask < LY.OUT_RG
                 rg = fx.min(optask, LY.OUT_RG - 1)
-                r_w = rsrc_if(ptr(layer, LY.P_OUT), is_op, HIDDEN * GDN_VAL_DIM)
-                NKC = GDN_VAL_DIM // 128  # 48 chunks of 128 K
+                # K: the rank's v heads (GDN) / q heads x 256 (QSA), both GM.VAL_DIM
+                r_w = rsrc_if(ptr(layer, LY.P_OUT), is_op, HIDDEN * GM.VAL_DIM)
+                NKC = GM.VAL_DIM // 128  # 48 chunks of 128 K (TP 2: 24)
                 NKH = NKC // OP_KS  # chunks per staged K part
                 CPW = NKH // WAVES
-                KP = GDN_VAL_DIM // OP_KS
+                assert CPW * WAVES == NKH
+                KP = GM.VAL_DIM // OP_KS
 
                 def part_units(hh):
                     part = []
@@ -2272,7 +2289,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 (
                                     (
                                         bcolq(ACT, S_OG, (kc - hh * NKH) * 64),
-                                        lambda ct, kc=kc: OPINV + tcol(ct) * GDN_HV + kc,
+                                        lambda ct, kc=kc: OPINV + tcol(ct) * GM.HV + kc,
                                     )
                                     if kind == "gdn" and NORM_IN_OP
                                     else bcolq(ACT, S_OG, (kc - hh * NKH) * 64)
@@ -2285,7 +2302,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     return part
 
                 gdn_inv = (
-                    (lambda row, e: OPINV + row * GDN_HV + e // 128)
+                    (lambda row, e: OPINV + row * GM.HV + e // 128)
                     if kind == "gdn" and NORM_IN_OP
                     else None
                 )
@@ -2318,7 +2335,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             lds_st(
                                 xs,
                                 OPINV
-                                + (idx // C_TASKS) * GDN_HV
+                                + (idx // C_TASKS) * GM.HV
                                 + (idx % C_TASKS) // CSPLIT,
                                 rs,
                             )
@@ -2339,13 +2356,13 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         lds_st(xs, ASC + tid, am * (1.0 / 448.0))
                         lds_st(xs, AINV + tid, fx.Float32(1.0) / (am * (1.0 / 448.0)))
                     gpu.barrier()
-                    for q0 in range_constexpr(0, NT * GDN_HV, THREADS):
+                    for q0 in range_constexpr(0, NT * GM.HV, THREADS):
                         q = tid + q0
-                        if q < NT * GDN_HV:
+                        if q < NT * GM.HV:
                             lds_st(
                                 xs,
                                 OPINV + q,
-                                lds_ld(xs, OPINV + q) * lds_ld(xs, AINV + q // GDN_HV),
+                                lds_ld(xs, OPINV + q) * lds_ld(xs, AINV + q // GM.HV),
                             )
                     gpu.barrier()
 
@@ -2391,7 +2408,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             ACT,
                             S_OG,
                             batch=OG_BATCH,
-                            row_elems=GDN_VAL_DIM,
+                            row_elems=GM.VAL_DIM,
                         )
                     og_amax = mb(layer, "og_amax")
                     if const_expr(kind == "gdn"):
@@ -2449,26 +2466,27 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 )
                     else:
                         # merge tasks published max |og| per (row, head); rows tid < NT (+ the combine inputs)
+                        HQ = GM.HQ
                         if const_expr(CPRE):
                             gall = poll(
                                 [
-                                    (og_amax, fx.min(tid, NT - 1) * 24 + h_, 1, tid < NT)
-                                    for h_ in range(24)
+                                    (og_amax, fx.min(tid, NT - 1) * HQ + h_, 1, tid < NT)
+                                    for h_ in range(HQ)
                                 ]
                                 + cpre,
-                                24 + len(cpre),
+                                HQ + len(cpre),
                             )
-                            cgot = gall[24:]
+                            cgot = gall[HQ:]
                         if tid < NT:
                             got = (
                                 gall
                                 if const_expr(CPRE)
                                 else poll(
-                                    [(og_amax, tid * 24 + h_, 1) for h_ in range(24)]
+                                    [(og_amax, tid * HQ + h_, 1) for h_ in range(HQ)]
                                 )
                             )
                             am = got[0][0].bitcast(fx.Float32)
-                            for h_ in range_constexpr(1, 24):
+                            for h_ in range_constexpr(1, HQ):
                                 am = fx.max(am, got[h_][0].bitcast(fx.Float32))
                             am = fx.max(am, fx.Float32(1e-12))
                             lds_st(xs, ASC + tid, am * (1.0 / 448.0))
@@ -2482,7 +2500,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             KP,
                             ACT,
                             S_OG,
-                            row_elems=GDN_VAL_DIM,
+                            row_elems=GM.VAL_DIM,
                             amax_known=True,
                             batch=OG_BATCH,
                             inv_of=gdn_inv,
@@ -2505,7 +2523,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 ACT,
                                 S_OG,
                                 batch=OG_BATCH,
-                                row_elems=GDN_VAL_DIM,
+                                row_elems=GM.VAL_DIM,
                                 elem0=hh * KP,
                             )
                         else:
@@ -2514,7 +2532,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 KP,
                                 ACT,
                                 S_OG,
-                                row_elems=GDN_VAL_DIM,
+                                row_elems=GM.VAL_DIM,
                                 elem0=hh * KP,
                                 amax_known=True,
                                 batch=OG_BATCH,
@@ -2784,7 +2802,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 mid = mb(layer, "mid")
                 gupart = mb(layer, "gupart") if KPG == 2 else None
                 ns = n_slots()
-                TPS = LY.GU_PAIRS  # tasks per slot
+                TPS = GM.GU_PAIRS  # tasks per slot
                 ntask = ns * TPS
                 gw = cta * WAVES + wave
                 NWV = NCTA * WAVES
@@ -2795,15 +2813,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     sl = task // TPS
                     tile = task % TPS
                     e = _uniform(lds_ld(xi, SLOT_E + sl))
-                    r_g = _rsrc(gu + fx.Int64(e) * LY.GU_BYTES)
-                    r_s = _rsrc(gus + fx.Int64(e) * LY.GU_SBYTES)
+                    r_g = _rsrc(gu + fx.Int64(e) * GM.GU_BYTES)
+                    r_s = _rsrc(gus + fx.Int64(e) * GM.GU_SBYTES)
                     KTP = (HIDDEN // 128) // KPG  # 128-K chunks of this CTA's K range
                     # units [0, KTP): gate tile `tile`; [KTP, 2 KTP): up tile `tile + 48` (w13 rows 768 + 16 tile ..)
                     accg, accu = wave_mma(
                         lambda u: unit_mxfp4a(
                             r_g,
                             r_s,
-                            tile + (0 if u < KTP else LY.UP_TILE0),
+                            tile + (0 if u < KTP else GM.UP_TILE0),
                             kh * KTP + u % KTP,
                             HIDDEN,
                             bcolq(GU_ACT, S_GU, (u % KTP) * 64),
@@ -2827,7 +2845,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 hv.append(g * sigmoid(g) * accu[ct * 4 + i])
                             if ok:
                                 base = (
-                                    (tc * NPAIR + rk) * MOE_INTER + tile * 16 + rows
+                                    (tc * NPAIR + rk) * MI + tile * 16 + rows
                                 ) // 2
                                 put_bf(mid, base, hv[0], hv[1])
                                 put_bf(mid, base + 1, hv[2], hv[3])
@@ -2835,7 +2853,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             # K half 0 publishes its f32 gate (pairs [0, 640)) / up (pairs [640, 1280)) partials; the
                             # sibling CTA's wave (half 1, same task at the same loop step) adds them
                             pidx = (
-                                (tc * NPAIR + fx.max(rk, fx.Int32(0))) * (2 * MOE_INTER)
+                                (tc * NPAIR + fx.max(rk, fx.Int32(0))) * (2 * MI)
                                 + tile * 16
                                 + rows
                             )
@@ -2844,14 +2862,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     put4(gupart, pidx, accg[ct * 4 : ct * 4 + 4])
                                     put4(
                                         gupart,
-                                        pidx + MOE_INTER,
+                                        pidx + MI,
                                         accu[ct * 4 : ct * 4 + 4],
                                     )
                             else:
                                 got_h0 = poll(
                                     [(gupart, pidx + 2 * hf, 2, ok) for hf in range(2)]
                                     + [
-                                        (gupart, pidx + MOE_INTER + 2 * hf, 2, ok)
+                                        (gupart, pidx + MI + 2 * hf, 2, ok)
                                         for hf in range(2)
                                     ]
                                 )
@@ -2866,7 +2884,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     hv_h.append(g_h * sigmoid(g_h) * u_h)
                                 if ok:
                                     base_h = (
-                                        (tc * NPAIR + rk) * MOE_INTER + tile * 16 + rows
+                                        (tc * NPAIR + rk) * MI + tile * 16 + rows
                                     ) // 2
                                     put_bf(mid, base_h, hv_h[0], hv_h[1])
                                     put_bf(mid, base_h + 1, hv_h[2], hv_h[3])
@@ -2878,7 +2896,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 (routed pairs; zero for unrouted rows) once and loops over its output row groups; partials
                 dpart[g][t][2560]; then CTA rg < 160 sums the groups, applies the combine and publishes h2 (+ sum-of-squares
                 partials)."""
-                KT = MOE_INTER // 128  # 128-K MXFP4 chunks per slot
+                # 128-K MXFP4 chunks per slot: KT_FULL whole + the tail chunk (TP 2: K 256 .. 319, lane groups
+                # 0, 1 of the chunk's MFMA K layout; groups 2, 3 load no weights and read zero mid)
+                KT = KT_FULL + (1 if DN_TAIL else 0)
                 NU = SG * KT
                 dn = ptr(layer, LY.P_DN)
                 dns = ptr(layer, LY.P_DN_S)
@@ -2890,7 +2910,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 # rotate the group placement by the CTAs of the last gate_up round (multi-round only): the groups
                 # whose mid is complete early land on the CTAs that finish gate_up first; same tasks and sums
                 NWV_GU = (G // KPG) * WAVES
-                ntask_gu = ns * LY.GU_PAIRS
+                ntask_gu = ns * GM.GU_PAIRS
                 nr_gu = (ntask_gu + NWV_GU - 1) // NWV_GU
                 last_gu = ntask_gu - (nr_gu - 1) * NWV_GU
                 rot = _uniform(
@@ -2948,7 +2968,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 npr = _uniform(lds_ld(xi, NSV + 1))
                 if live_g:
                     # stage the routed rows' mid of the group's slots: LDS [S][SG * 640] (zero elsewhere)
-                    NQP = MOE_INTER // 4  # 16-byte output quads per pair
+                    NQP = MI // 4  # 16-byte output quads per pair
                     IB = 4  # items per thread per poll round
                     nit = npr * NQP
                     nround = (nit + THREADS * IB - 1) // (THREADS * IB)
@@ -2969,7 +2989,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             [
                                 (
                                     mid,
-                                    ((t * NPAIR + rk) * MOE_INTER + 4 * kq) // 2,
+                                    ((t * NPAIR + rk) * MI + 4 * kq) // 2,
                                     2,
                                     ok,
                                 )
@@ -2979,7 +2999,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         for n_ in range_constexpr(len(items)):
                             ok, t, sj, kq, rk = items[n_]
                             if ok:
-                                o = MID + t * S_MID + sj * (MOE_INTER // 2) + kq * 2
+                                o = MID + t * S_MID + sj * (MI // 2) + kq * 2
                                 lds_st(xi, o, hw[n_][0])
                                 lds_st(xi, o + 1, hw[n_][1])
                         _ = yield [fx.Int32(0)]
@@ -2998,9 +3018,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     okl = sl < ns
                     rds.append(
                         (
-                            rsrc_if(dn + fx.Int64(e) * LY.DN_BYTES, okl, LY.DN_BYTES),
+                            rsrc_if(dn + fx.Int64(e) * GM.DN_BYTES, okl, GM.DN_BYTES),
                             rsrc_if(
-                                dns + fx.Int64(e) * LY.DN_SBYTES, okl, LY.DN_SBYTES
+                                dns + fx.Int64(e) * GM.DN_SBYTES, okl, GM.DN_SBYTES
                             ),
                         )
                     )
@@ -3008,15 +3028,30 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 def dn_unit(u, rg, sdws):
                     sj, kt = u // KT, u % KT
                     coef = lambda ct, sj=sj: lds_ld(xs, SWG + sj * NT + tcol(ct))
+                    bw = bcolq(MID, S_MID, sj * (MI // 2) + kt * 64)
+                    kmask = None
+                    if const_expr(kt == KT_FULL):
+                        # the tail chunk: lane group j holds K 32 j .. 32 j + 31; past the real K its B operand is the
+                        # row's zero pad (never mid past I: the next slot's values could be inf, inf * 0 = NaN)
+                        kmask = (lane // 16) < DN_TAIL // 32
+                        bw = lambda ct, sj=sj, kt=kt: (
+                            MID
+                            + tcol(ct) * S_MID
+                            + kmask.select(
+                                sj * (MI // 2) + kt * 64 + (lane // 16) * 16,
+                                fx.Int32(SG * (MI // 2) + 4),
+                            )
+                        )
                     return unit_mxfp4a(
                         rds[sj][0],
                         rds[sj][1],
                         rg,
                         kt,
-                        LY.MOE_INTER_PAD,  # w2 rows: padded K
-                        bcolq(MID, S_MID, sj * (MOE_INTER // 2) + kt * 64),
+                        GM.MOE_INTER_PAD,  # w2 rows: padded K
+                        bw,
                         coef=coef,
                         sdw=sdws[sj][kt // 2],
+                        kmask=kmask,
                     )
 
                 for ir, _c in range(fx.Int32(0), nrg, 1, init=[fx.Int32(0)]):
@@ -3026,7 +3061,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # block is 256 B per 32 rows x 8 groups, of which one unit uses 64 B
                     sdws = [
                         [
-                            mxfp4a_sdw(rds[sj][1], rg, d, LY.MOE_INTER_PAD)
+                            mxfp4a_sdw(rds[sj][1], rg, d, GM.MOE_INTER_PAD)
                             for d in range((KT + 1) // 2)
                         ]
                         for sj in range(SG)
@@ -3120,6 +3155,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
             # ---- QSA (sparse full attention)
             GI = n_layers  # global pointer-table row
+            # attention of the rank's heads: KVA kv heads of HPK q heads (TP 1: 2 x 12, TP 2: 1 x 12)
+            HQ_A, KVA = GM.HQ, GM.KV
+            HPK = HQ_A // KVA
+            NQI = HQ_A * 128 // THREADS  # q words a thread
+            assert HPK == 12 and NQI * THREADS == HQ_A * 128 and KVA in (1, 2)
 
             def rtt_at(rtt_row, tok):
                 return fx.Int32(bo.buffer_load(rtt_row, tok, vec_width=1, dtype=T.i32))
@@ -3186,7 +3226,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
             def qp_elems(qp, specs):
                 """[(t, e)] -> elements e of token t of the fused projection mailbox (one batched poll)."""
-                ws = poll([(qp, t * (LY.QP_ROWS // 2) + e // 2, 1) for t, e in specs])
+                ws = poll([(qp, t * (GM.QP_ROWS // 2) + e // 2, 1) for t, e in specs])
                 out = []
                 for i in range_constexpr(len(specs)):
                     lo, hi = bf2_f32(ws[i][0])
@@ -3198,15 +3238,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     lambda: stage_act8(mb(layer, "a.mixx")),
                     None,
                     None,
-                    (LY.QP_RG + G - 1) // G,
-                    lambda i: fx.min(bid + i * G, LY.QP_RG - 1),
+                    (GM.QP_RG + G - 1) // G,
+                    lambda i: fx.min(bid + i * G, GM.QP_RG - 1),
                     emit8_bf_rows(
                         mb(layer, "qp"),
-                        LY.QP_ROWS // 2,
-                        valid=lambda i: bid + i * G < LY.QP_RG,
+                        GM.QP_ROWS // 2,
+                        valid=lambda i: bid + i * G < GM.QP_RG,
                     ),
                     split=(
-                        LY.QP_RG_QKV,
+                        GM.QP_RG_QKV,
                         ptr(layer, LY.P_IP),
                         ptr(layer, LY.P_IP_S),
                         ptr(layer, LY.P_IP2),
@@ -3278,8 +3318,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
             def stage_qsa_prep(layer):
                 qp = mb(layer, "qp")
                 r_cos = _rsrc(ptr(GI, LY.G_COS))
-                ptask = placed(LY.PREP_BASE)
-                if ptask < LY.PREP_Q_TASKS:
+                ptask = placed(GM.PREP_BASE)
+                if ptask < GM.PREP_Q_TASKS:
                     h = ptask
                     heads_norm_rope(
                         qp,
@@ -3298,12 +3338,13 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             t = q // 128
                             put(
                                 mb(layer, "q"),
-                                t * (24 * 128) + h * 128 + q % 128,
+                                t * (GM.HQ * 128) + h * 128 + q % 128,
                                 lds_ld(xi, PREP_OFF + q),
                             )
                     gpu.barrier()
-                if (ptask >= LY.PREP_K_CTA) & (ptask < LY.PREP_K_CTA + 2):
-                    kvh = ptask - LY.PREP_K_CTA
+                if (ptask >= GM.PREP_K_CTA) & (ptask < GM.PREP_K_CTA + GM.KV):
+                    # the rank's KV heads (TP 2: one, head ``rank`` of the model)
+                    kvh = ptask - GM.PREP_K_CTA
                     kvnew = mb(layer, "kvnew")
                     r_loc = _rsrc(ptr(GI, LY.G_LOC))
                     NW = NT * 128
@@ -3324,7 +3365,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # v shares the k poll round
                     vall = heads_norm_rope(
                         qp,
-                        lambda row: (row, LY.QP_K_OFF + kvh * 256),
+                        lambda row: (row, GM.QP_K_OFF + kvh * 256),
                         256,
                         ptr(layer, LY.P_KNORM),
                         r_cos,
@@ -3332,7 +3373,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         PREP_OFF,
                         NT,
                         extra=[
-                            (qc // 128, LY.QP_V_OFF + kvh * 256 + 2 * (qc % 128) + d_)
+                            (qc // 128, GM.QP_V_OFF + kvh * 256 + 2 * (qc % 128) + d_)
                             for qc in qcs
                             for d_ in range(2)
                         ],
@@ -3346,25 +3387,29 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         loc = locs[i]
                         r_k = _rsrc(
                             ptr(layer, LY.P_KBUF)
-                            + fx.Int64(loc) * 1024
+                            + fx.Int64(loc) * (GM.KV * 512)
                             + fx.Int64(kvh * 512)
                         )
                         r_v = _rsrc(
                             ptr(layer, LY.P_VBUF)
-                            + fx.Int64(loc) * 1024
+                            + fx.Int64(loc) * (GM.KV * 512)
                             + fx.Int64(kvh * 512)
                         )
                         if q < NW:
                             kw = lds_ld(xi, PREP_OFF + q)
                             vw = bf16_pair(v[0], v[1]).bitcast(fx.Int32)
-                            put(kvnew, t * 512 + kvh * 128 + e, kw)
-                            put(kvnew, t * 512 + 256 + kvh * 128 + e, vw)
+                            put(kvnew, t * (GM.KV * 256) + kvh * 128 + e, kw)
+                            put(
+                                kvnew,
+                                t * (GM.KV * 256) + GM.KV * 128 + kvh * 128 + e,
+                                vw,
+                            )
                             bo.buffer_store(kw, r_k, e)
                             bo.buffer_store(vw, r_v, e)
                     gpu.barrier()
-                if (ptask >= LY.PREP_IDX_CTA0) & (ptask < LY.PREP_IDX_CTA0 + R):
+                if (ptask >= GM.PREP_IDX_CTA0) & (ptask < GM.PREP_IDX_CTA0 + R):
                     # request r: index q (4 heads x 128) of its L tokens, then its index-key ring / compression
-                    r = ptask - LY.PREP_IDX_CTA0
+                    r = ptask - GM.PREP_IDX_CTA0
                     tok0 = r * L
                     pos0 = req_p0(r)
                     req = _uniform(lds_ld(xi, RQ_REQ + r))
@@ -3443,7 +3488,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     qks = [fx.min(tid + i * THREADS, NK - 1) for i in range(NIK)]
                     kall = heads_norm_rope(
                         qp,
-                        lambda row: (tok0 + row // 4, LY.QP_IDX_OFF + (row % 4) * 128),
+                        lambda row: (tok0 + row // 4, GM.QP_IDX_OFF + (row % 4) * 128),
                         128,
                         ptr(layer, LY.P_IQNORM),
                         r_cos,
@@ -3451,7 +3496,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         PREP_OFF,
                         4 * L,
                         extra=[
-                            (tok0 + q // 128, LY.QP_IDX_OFF + 512 + q % 128) for q in qks
+                            (tok0 + q // 128, GM.QP_IDX_OFF + 512 + q % 128) for q in qks
                         ],
                     )
                     NW = L * 256
@@ -3537,7 +3582,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 The first item's req_to_token / compressed-key loads are issued before the qi poll, and its in-batch
                 keys (cnew) share the qi poll round."""
                 ntile = _uniform(lds_ld(xi, SC_PFX + R))
-                stask = placed(LY.SCORES_BASE)
+                stask = placed(GM.SCORES_BASE)
                 if stask * WAVES < ntile:
                     qi = mb(layer, "qi")
                     gw = stask * WAVES + wave
@@ -3924,7 +3969,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
             def attn_task(layer, t, c, task, is_blk):
                 """Split flash-decode on MFMA: task (token t, chunk c of 64 selected tokens) -> partial (o, m, l) of all
-                24 heads in part slot ``task``; waves [4 kvh, 4 kvh + 4) serve kv head kvh. Batch tokens of the row's
+                rank's q heads (TP 1: 24) in part slot ``task``; waves [4 kvh, 4 kvh + 4) serve kv head kvh (TP 2: one
+                kv head, waves 4 .. 7 idle in the MFMA phases). Batch tokens of the row's
                 request (pos >= pos0 of the request) read K/V from kvnew. ``is_blk`` (trace time): a chunk of 16
                 selected blocks; else the tail chunk (the <= 3 tokens of the incomplete last block, c = 32)."""
                 r = t // L
@@ -3940,7 +3986,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 # segments: 512 < nb) -> computed here, so q and this thread's (block, loc) share one poll round
                 nsel = fx.min(fx.Int32(512), seq // 4)
                 qspec = [
-                    (qmb, t * (24 * 128) + tid + i * THREADS, 1) for i in range(6)
+                    (qmb, t * (HQ_A * 128) + tid + i * THREADS, 1) for i in range(NQI)
                 ]
                 if const_expr(is_blk):
                     si = c * 16 + j // 4
@@ -3950,15 +3996,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 else:
                     # the tail chunk does not read the selection: q only
                     got = poll(qspec)
-                for i in range_constexpr(6):
+                for i in range_constexpr(NQI):
                     pq = tid + i * THREADS
                     hd = pq // 128
                     lds_st(
                         xi,
-                        ATT_Q_OFF + ((hd // 12) * 16 + hd % 12) * ATT_KS + pq % 128,
+                        ATT_Q_OFF + ((hd // HPK) * 16 + hd % HPK) * ATT_KS + pq % 128,
                         got[i][0],
                     )
-                for i in range_constexpr(2):
+                for i in range_constexpr(KVA):
                     z = tid + i * THREADS
                     lds_st(
                         xi,
@@ -3968,9 +4014,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         fx.Int32(0),
                     )
                 if const_expr(is_blk):
-                    tok = got[6][0] * 4 + j % 4
+                    tok = got[NQI][0] * 4 + j % 4
                     valid = si < nsel
-                    locv = got[6][1] + j % 4
+                    locv = got[NQI][1] + j % 4
                 else:
                     # the incomplete last block: tokens [(seq // 4) * 4, seq)
                     tok = (seq // 4) * 4 + j
@@ -3979,8 +4025,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 tokc = fx.min(fx.max(tok, fx.Int32(0)), seq - 1)
                 # thread ch holds the 16 B chunks ch + 8 q (dims 8 (ch + 8 q) .. + 8) of its K/V rows; 64-bit
                 # addresses: the KV pools may exceed 4 GB
-                rowk = ptr(layer, LY.P_KBUF) + fx.Int64(locv) * 1024
-                rowv = ptr(layer, LY.P_VBUF) + fx.Int64(locv) * 1024
+                rowk = ptr(layer, LY.P_KBUF) + fx.Int64(locv) * (KVA * 512)
+                rowv = ptr(layer, LY.P_VBUF) + fx.Int64(locv) * (KVA * 512)
                 kw = [
                     [
                         fx.Vector(
@@ -3988,7 +4034,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         )
                         for q in range(4)
                     ]
-                    for kvh in range(2)
+                    for kvh in range(KVA)
                 ]
                 vw = [
                     [
@@ -3997,17 +4043,17 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         )
                         for q in range(4)
                     ]
-                    for kvh in range(2)
+                    for kvh in range(KVA)
                 ]
                 if valid & (tokc >= pos0):
                     kvnew = mb(layer, "kvnew")
                     tb = r * L + tokc - pos0
-                    for kvh in range_constexpr(2):
+                    for kvh in range_constexpr(KVA):
                         kn = poll(
                             [
                                 (
                                     kvnew,
-                                    tb * 512
+                                    tb * (KVA * 256)
                                     + kvh * 128
                                     + (ch + 8 * q) * 4
                                     + 2 * hf,
@@ -4021,8 +4067,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             [
                                 (
                                     kvnew,
-                                    tb * 512
-                                    + 256
+                                    tb * (KVA * 256)
+                                    + KVA * 128
                                     + kvh * 128
                                     + (ch + 8 * q) * 4
                                     + 2 * hf,
@@ -4044,7 +4090,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                             for q in range(4)
                         ]
-                for kvh in range_constexpr(2):
+                for kvh in range_constexpr(KVA):
                     for q in range_constexpr(4):
                         for e in range_constexpr(4):
                             lds_st(
@@ -4064,41 +4110,48 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                 gpu.barrier()
                 # ---- S = Q K^T (MFMA): wave -> (kv head, 16-token tile), full 256 dims
+                def sphase():
+                    cacc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for ks in range_constexpr(8):
+                        dw = ks * 16 + (lane // 16) * 4
+                        a = fx.ptr_load(
+                            xs + (ATT_Q_OFF + (kvw * 16 + lane % 16) * ATT_KS + dw),
+                            result_type=v4f,
+                        ).bitcast(fx.BFloat16)
+                        bk = fx.ptr_load(
+                            xs
+                            + (
+                                ATT_OFF
+                                + kvw * ATT_KV_WORDS
+                                + (nt_ * 16 + lane % 16) * ATT_KS
+                                + dw
+                            ),
+                            result_type=v4f,
+                        ).bitcast(fx.BFloat16)
+                        cacc = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, bk, cacc])
+                        )
+                    for i in range_constexpr(4):
+                        lds_st(
+                            xs,
+                            ATT_S_OFF
+                            + kvw * 1024
+                            + (4 * (lane // 16) + i) * 64
+                            + nt_ * 16
+                            + lane % 16,
+                            cacc[i],
+                        )
+
                 kvw = wave // 4
                 nt_ = wave % 4
-                cacc = fx.Vector.filled(4, 0.0, fx.Float32)
-                for ks in range_constexpr(8):
-                    dw = ks * 16 + (lane // 16) * 4
-                    a = fx.ptr_load(
-                        xs + (ATT_Q_OFF + (kvw * 16 + lane % 16) * ATT_KS + dw),
-                        result_type=v4f,
-                    ).bitcast(fx.BFloat16)
-                    bk = fx.ptr_load(
-                        xs
-                        + (
-                            ATT_OFF
-                            + kvw * ATT_KV_WORDS
-                            + (nt_ * 16 + lane % 16) * ATT_KS
-                            + dw
-                        ),
-                        result_type=v4f,
-                    ).bitcast(fx.BFloat16)
-                    cacc = fx.Vector(
-                        rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, bk, cacc])
-                    )
-                for i in range_constexpr(4):
-                    lds_st(
-                        xs,
-                        ATT_S_OFF
-                        + kvw * 1024
-                        + (4 * (lane // 16) + i) * 64
-                        + nt_ * 16
-                        + lane % 16,
-                        cacc[i],
-                    )
+                if const_expr(KVA == 2):
+                    sphase()
+                else:
+                    if wave < 4:
+                        sphase()
                 gpu.barrier()
                 # ---- V^T into the K regions (K is dead), softmax of the 2 x 16 (padded) head rows -> P (bf16)
-                for kvh in range_constexpr(2):
+                for kvh in range_constexpr(KVA):
                     for q in range_constexpr(4):
                         vv = vw[kvh][q].bitcast(fx.BFloat16)
                         for e in range_constexpr(8):
@@ -4112,11 +4165,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 ),
                             )
                 okv = lds_ld(xi, ATT_M_OFF + 64 + lane) != 0
-                for r in range_constexpr(4):
+                for r in range_constexpr(2 * KVA):
                     row = wave + 8 * r  # (kvh, head) row: kvh = row // 16
                     hl = row % 16
                     sv = lds_ld(xs, ATT_S_OFF + row * 64 + lane) * (1.0 / 16.0)
-                    live = okv & (hl < 12)
+                    live = okv & (hl < HPK)
                     sv = live.select(sv, fx.Float32(NEG_INF))
                     mx = sv
                     for off in (32, 16, 8, 4, 2, 1):
@@ -4127,53 +4180,61 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         pv.to(fx.BFloat16),
                         xb + (ATT_P_OFF * 2 + row * ATT_VS + lane),
                     )
-                    if (lane == 0) & (hl < 12):
-                        hh = (row // 16) * 12 + hl
+                    if (lane == 0) & (hl < HPK):
+                        hh = (row // 16) * HPK + hl
                         lds_st(xs, ATT_M_OFF + hh, mx)
-                        lds_st(xs, ATT_M_OFF + 24 + hh, sm)
+                        lds_st(xs, ATT_M_OFF + HQ_A + hh, sm)
                 gpu.barrier()
                 # ---- O = P V (MFMA): wave -> (kv head, 64 dims)
                 part = mb(layer, "part")
-                pbase = task * LY.PART_STRIDE
-                for t2 in range_constexpr(4):
-                    n0 = nt_ * 64 + t2 * 16
-                    oacc = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for ks in range_constexpr(2):
-                        ke = ks * 32 + (lane // 16) * 8
-                        a = fx.ptr_load(
-                            xs
-                            + (
-                                ATT_P_OFF
-                                + ((kvw * 16 + lane % 16) * ATT_VS + ke) // 2
-                            ),
-                            result_type=v4f,
-                        ).bitcast(fx.BFloat16)
-                        bv = fx.ptr_load(
-                            xs
-                            + (
-                                ATT_OFF
-                                + kvw * ATT_KV_WORDS
-                                + ((n0 + lane % 16) * ATT_VS + ke) // 2
-                            ),
-                            result_type=v4f,
-                        ).bitcast(fx.BFloat16)
-                        oacc = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(
-                                T.vec(4, T.f32), [a, bv, oacc]
+                pbase = task * GM.PART_STRIDE
+
+                def pvphase():
+                    for t2 in range_constexpr(4):
+                        n0 = nt_ * 64 + t2 * 16
+                        oacc = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for ks in range_constexpr(2):
+                            ke = ks * 32 + (lane // 16) * 8
+                            a = fx.ptr_load(
+                                xs
+                                + (
+                                    ATT_P_OFF
+                                    + ((kvw * 16 + lane % 16) * ATT_VS + ke) // 2
+                                ),
+                                result_type=v4f,
+                            ).bitcast(fx.BFloat16)
+                            bv = fx.ptr_load(
+                                xs
+                                + (
+                                    ATT_OFF
+                                    + kvw * ATT_KV_WORDS
+                                    + ((n0 + lane % 16) * ATT_VS + ke) // 2
+                                ),
+                                result_type=v4f,
+                            ).bitcast(fx.BFloat16)
+                            oacc = fx.Vector(
+                                rocdl.mfma_f32_16x16x32_bf16(
+                                    T.vec(4, T.f32), [a, bv, oacc]
+                                )
                             )
-                        )
-                    if lane < 48:  # rows (heads) 4 (lane // 16) + i < 12
-                        for i in range_constexpr(4):
-                            put(
-                                part,
-                                pbase
-                                + (kvw * 12 + 4 * (lane // 16) + i) * 256
-                                + n0
-                                + lane % 16,
-                                oacc[i],
-                            )
-                if tid < 48:
-                    put(part, pbase + 24 * 256 + tid, lds_ld(xs, ATT_M_OFF + tid))
+                        if lane < 4 * HPK:  # rows (heads) 4 (lane // 16) + i < HPK
+                            for i in range_constexpr(4):
+                                put(
+                                    part,
+                                    pbase
+                                    + (kvw * HPK + 4 * (lane // 16) + i) * 256
+                                    + n0
+                                    + lane % 16,
+                                    oacc[i],
+                                )
+
+                if const_expr(KVA == 2):
+                    pvphase()
+                else:
+                    if wave < 4:
+                        pvphase()
+                if tid < 2 * HQ_A:
+                    put(part, pbase + HQ_A * 256 + tid, lds_ld(xs, ATT_M_OFF + tid))
                 gpu.barrier()
 
             def stage_qsa_attn(layer):
@@ -4191,7 +4252,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
             def stage_qsa_tail(layer):
                 """The tail chunk of token t (part slot t * ATT_TASKS + 32) on CTA tail_base + t: it needs only q and
                 kvnew / the KV cache (prep), not the selection, so it runs while scores and select run elsewhere."""
-                tt = placed(LY.tail_base(R, NT))
+                tt = placed(LY.tail_base(R, NT, TPW))
                 if tt < NT:
                     attn_task(
                         layer,
@@ -4204,20 +4265,20 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
             def stage_qsa_merge(layer):
                 """Task (token, head): combine the chunk partials, sigmoid gate -> og."""
                 qp = mb(layer, "qp")
-                NTASK = NT * LY.MERGE_TASKS
+                NTASK = NT * GM.MERGE_TASKS
                 MG = G
                 nloop = (NTASK - bid + MG - 1) // MG
                 for it, _c in range(fx.Int32(0), nloop, 1, init=[fx.Int32(0)]):
                     it = fx.Int32(it)
                     task = bid + it * MG
-                    t = task // LY.MERGE_TASKS
-                    h = task % LY.MERGE_TASKS
+                    t = task // GM.MERGE_TASKS
+                    h = task % GM.MERGE_TASKS
                     part = mb(layer, "part")
                     NC = LY.ATT_CHUNKS
-                    tb = t * LY.ATT_TASKS * LY.PART_STRIDE
+                    tb = t * LY.ATT_TASKS * GM.PART_STRIDE
                     if tid < NC:
-                        pb = tb + tid * LY.PART_STRIDE + 24 * 256
-                        ml = poll([(part, pb + h, 1), (part, pb + 24 + h, 1)])
+                        pb = tb + tid * GM.PART_STRIDE + GM.HQ * 256
+                        ml = poll([(part, pb + h, 1), (part, pb + GM.HQ + h, 1)])
                         lds_st(xs, OUTS + tid, ml[0][0].bitcast(fx.Float32))
                         lds_st(xs, OUTS + 64 + tid, ml[1][0].bitcast(fx.Float32))
                     gpu.barrier()
@@ -4230,13 +4291,13 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         O = fx.Float32(0.0)
                         got = poll(
                             [
-                                (part, tb + cc * LY.PART_STRIDE + h * 256 + d, 1)
+                                (part, tb + cc * GM.PART_STRIDE + h * 256 + d, 1)
                                 for cc in range(NC)
                             ]
                             + [
                                 (
                                     qp,
-                                    t * (LY.QP_ROWS // 2) + (h * 512 + 256 + d) // 2,
+                                    t * (GM.QP_ROWS // 2) + (h * 512 + 256 + d) // 2,
                                     1,
                                 )
                             ],
@@ -4257,7 +4318,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     if tid < 128:
                         put(
                             mb(layer, "og"),
-                            t * (GDN_VAL_DIM // 2) + h * 128 + tid,
+                            t * (GM.VAL_DIM // 2) + h * 128 + tid,
                             lds_ld(xi, OUTS + 128 + tid),
                         )
                     # max |og| of (row, head) for the o_proj FP8 activation scale (waves 0, 1 hold the 256 values)
@@ -4271,7 +4332,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     if tid == 0:
                         put(
                             mb(layer, "og_amax"),
-                            t * 24 + h,
+                            t * GM.HQ + h,
                             fx.max(lds_ld(red, 0), lds_ld(red, 1)),
                         )
                     gpu.barrier()
@@ -5086,7 +5147,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 lane = tid % 64
                 wave = tid // 64
                 h1 = ("mb", mb(li, "h1"), "mb", mb(li, "h1ssq"), LY.NPART)
-                mbase = LY.mixm_base(kind, NT)
+                mbase = LY.mixm_base(kind, NT, TPW)
                 stage_mix(
                     li, "m", h1, LY.P_HCM_NORM, LY.P_HCM_DOWN, LY.P_HCM_UP, base=mbase
                 )

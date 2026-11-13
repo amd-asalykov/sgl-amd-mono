@@ -190,28 +190,28 @@ def scores_ctas(R):
     return (R * (2048 // 16 + 1) + 7) // 8
 
 
-def tail_base(R, T):
+def tail_base(R, T, tp=1):
     """QSA attention tail chunk of row t on CTA tail_base + t (stage qsa_tail): past the index scores' CTAs, or,
-    if that reaches the select CTAs, just below the prep CTAs. Placement only: the tail polls prep outputs
-    alone, so any CTA range is deadlock-free."""
-    base = (SCORES_BASE + scores_ctas(R)) % 256
+    if that reaches the select CTAs, just below the prep CTAs (at TP ``tp``: the rank's prep / scores bases).
+    Placement only: the tail polls prep outputs alone, so any CTA range is deadlock-free."""
+    g = geom(tp)
+    base = (g.SCORES_BASE + scores_ctas(R)) % 256
     if _tail_ctas(base, T) & set(range(sel2_cta0(T), 256)):
-        base = PREP_BASE - T
+        base = g.PREP_BASE - T
     return base
 
 
 def _check_tail_base():
-    for R in range(1, 9):
-        for L in range(1, 32 // R + 1):
-            T = R * L
-            tail = _tail_ctas(tail_base(R, T), T)
-            prep = {(PREP_BASE + k) % 256 for k in range(PREP_IDX_CTA0 + R)}
-            scores = {(SCORES_BASE + k) % 256 for k in range(scores_ctas(R))}
-            sel = set(range(sel2_cta0(T), 256))
-            assert not tail & (prep | scores | sel), (R, L)
-
-
-_check_tail_base()
+    for tp in TP_SIZES:
+        g = geom(tp)
+        for R in range(1, 9):
+            for L in range(1, 32 // R + 1):
+                T = R * L
+                tail = _tail_ctas(tail_base(R, T, tp), T)
+                prep = {(g.PREP_BASE + k) % 256 for k in range(g.PREP_IDX_CTA0 + R)}
+                scores = {(g.SCORES_BASE + k) % 256 for k in range(scores_ctas(R))}
+                sel = set(range(sel2_cta0(T), 256))
+                assert not tail & (prep | scores | sel), (tp, R, L)
 
 
 SEL_STRIDE = 1026  # pairs per token: (block, loc) as 2 pairs each, count at pair 1024
@@ -313,8 +313,10 @@ def scratch_layout(n_layers: int, T: int, R: int = 1, tp: int = 1):
         add(p + "ip", T * g.IP_ROWS // 2)  # bf16 pairs
         # per (token, head, split) sum of squares of the GDN output
         add(p + "ssq", T * g.HV * g.MAX_CORE_SPLIT)
-        # per (row, producer task) max |og| (the FP8 activation scale)
-        add(p + "og_amax", T * g.HV * g.MAX_CORE_SPLIT)
+        # per (row, producer task) max |og| (the FP8 activation scale); a GDN core task
+        # publishes (ssq, max |og|) as 2 pairs when out_proj applies the gated norm
+        # (S <= 8): 2 pairs a core task (TP 1: HV x MAX_CORE_SPLIT = 2 x 192 too)
+        add(p + "og_amax", T * max(g.HV * g.MAX_CORE_SPLIT, 2 * g.HV * core_split(T, tp)))
         add(p + "h1", T * HC_DIM // 2)  # bf16 pairs
         add(p + "h1ssq", T * 4 * NPART)
         add(p + "logit", T * ROUTER_ROWS)  # f32
@@ -530,3 +532,6 @@ def verify_parity(step: int, launch_id: int) -> int:
 def draft_parity(step: int) -> int:
     """The peer-buffer half of a draft launch (one launch a step)."""
     return step & 1
+
+
+_check_tail_base()
