@@ -2860,8 +2860,20 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 ns = n_slots()
                 ng = (ns + SG - 1) // SG
                 cpg = G // ng  # CTAs per group
-                g = bid // cpg
-                jj = bid % cpg
+                # rotate the group placement by the CTAs of the last gate_up round (multi-round only): the groups
+                # whose mid is complete early land on the CTAs that finish gate_up first; same tasks and sums
+                NWV_GU = (G // KPG) * WAVES
+                ntask_gu = ns * LY.GU_PAIRS
+                nr_gu = (ntask_gu + NWV_GU - 1) // NWV_GU
+                last_gu = ntask_gu - (nr_gu - 1) * NWV_GU
+                rot = _uniform(
+                    (nr_gu > 1).select(
+                        ((last_gu + WAVES - 1) // WAVES) * KPG, fx.Int32(0)
+                    )
+                )
+                vb = (bid + G - rot) % G
+                g = vb // cpg
+                jj = vb % cpg
                 live_g = g < ng
                 gc = fx.min(g, ng - 1)
                 # pair rank / route weight of (group slot sj, row t); zero-filled mid tile
