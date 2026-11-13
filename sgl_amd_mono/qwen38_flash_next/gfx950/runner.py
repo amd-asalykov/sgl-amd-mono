@@ -173,6 +173,12 @@ class _Base:
             from .kernel import build_qwen38_flash_next_kernel
 
             launch = self._kernels[key] = build_qwen38_flash_next_kernel(key)
+            dump = os.environ.get("QWEN38_DUMP_KEYS")
+            if dump:  # debug: record the build keys a server compiles (for precompiling)
+                import msgspec
+
+                with open(dump, "ab") as f:
+                    f.write(msgspec.json.encode(key) + b"\n")
         return launch
 
     def _cached(self, key):
