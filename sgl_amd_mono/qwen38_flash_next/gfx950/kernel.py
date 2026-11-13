@@ -78,6 +78,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.ops import mxfp4_to_bf16x8 as _mxfp4_to_bf16x8
 from sgl_amd_mono.common.ops import rsrc as _rsrc
+from sgl_amd_mono.common.ops import clock as _clock
 from sgl_amd_mono.common.ops import uniform as _uniform
 from sgl_amd_mono.common.ops import wave_umax as _wave_umax
 from sgl_amd_mono.common.ops import xred as _xred
@@ -106,6 +107,17 @@ from sgl_amd_mono.common.sync import _spin
 from .layout import scratch_layout
 
 SOURCES = kernel_sources(__name__)
+
+
+def _dump_tl_names(kernel_name, names):
+    """Debug timeline: the stage names of a launch's marks, by its kernel name."""
+    import json
+    import os
+
+    d = os.path.expanduser("~/.flydsl/timeline")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, kernel_name + ".json"), "w") as f:
+        json.dump(names, f)
 
 POLL_MAX = 24
 NEG_INF = -3.0e38
@@ -194,7 +206,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     of ``key.plan`` for R = ``key.nreq`` requests x L = ``key.ntok`` tokens. The
     pointer table has one row per layer plus a global row (and the final mixer's
     row after it in a ``final_mix`` launch)."""
-    keyed = key_tuple(key, SOURCES)
+    TL = LY.timeline_enabled()
+    keyed = (*key_tuple(key, SOURCES), ("timeline", TL))
     plan, nreq, ntok = key.layers, key.nreq, key.ntok
     rtt_stride, pos_stride, map_i64 = key.rtt_stride, key.pos_stride, key.map_i64
     seq_p0, ring = key.seq_p0, key.ring
@@ -4476,6 +4489,29 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 lds_st(xi, SL_PFX + NT, acc_)
             gpu.barrier()
             tid0 = fx.thread_idx.x
+            tl_names = []
+
+            def mark(name):
+                """Debug timeline: thread 0 stores the clock after stage ``name``."""
+                if const_expr(TL):
+                    k = len(tl_names)
+                    tl_names.append(name)
+                    if tid0 == 0:
+                        at = (
+                            scratch
+                            + fx.Int64(LY.timeline_offset())
+                            + fx.Int64(bid) * fx.Int64(LY.TL_POINTS * 8)
+                            + fx.Int64(k * 8)
+                        )
+                        fx.generic_store(
+                            fx.inttoptr(
+                                fx.Pointer[fx.Int64, fx.AddressSpace.Global, 8].ir_type,
+                                at,
+                            ),
+                            _clock(),
+                        )
+
+            mark("start")
             if const_expr(first_src == "global"):
                 src = ("global", h_in, "global", ptr(GI, LY.G_HIN_SSQ), LY.NPART)
             if const_expr(first_src == "mtp"):
@@ -4494,6 +4530,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                 gpu.barrier()
                 stage_mtp_fusion()
+                mark("mtp_fusion")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
@@ -4515,16 +4552,19 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 gpu.barrier()
                 src = ("embed", ptr(GI, LY.G_EMBED_W))
                 stage_prelude()
+                mark("prelude")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
             gpu.barrier()
             if const_expr(ple_first):
                 stage_ple_proj(0)
+                mark("ple_proj")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
                 stage_ple_apply(0, src)
+                mark("ple_apply")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
@@ -4532,65 +4572,80 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
             for li in range_constexpr(n_layers):
                 kind = plan[li]
                 stage_mix(li, "a", src, LY.P_HCA_NORM, LY.P_HCA_DOWN, LY.P_HCA_UP)
+                mark(f"{li}.mix_a")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
                 if const_expr(kind == "gdn"):
                     stage_in_proj(li)
+                    mark(f"{li}.in_proj")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                     stage_core(li)
+                    mark(f"{li}.core")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                 else:
                     stage_qsa_proj(li)
+                    mark(f"{li}.qsa_proj")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                     stage_qsa_prep(li)
+                    mark(f"{li}.qsa_prep")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                     stage_qsa_scores(li)
+                    mark(f"{li}.qsa_scores")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                     stage_qsa_select(li)
+                    mark(f"{li}.qsa_select")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                     stage_qsa_merge_select(li)
+                    mark(f"{li}.qsa_merge_select")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                     stage_qsa_attn(li)
+                    mark(f"{li}.qsa_attn")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                     stage_qsa_merge(li)
+                    mark(f"{li}.qsa_merge")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
                 stage_out_proj(li, src, kind)
+                mark(f"{li}.out_proj")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
                 h1 = ("mb", mb(li, "h1"), "mb", mb(li, "h1ssq"), LY.NPART)
                 stage_mix(li, "m", h1, LY.P_HCM_NORM, LY.P_HCM_DOWN, LY.P_HCM_UP)
+                mark(f"{li}.mix_m")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
                 stage_router(li)
+                mark(f"{li}.router")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
                 stage_gate_up(li)
+                mark(f"{li}.gate_up")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
                 stage_down(li, h1, li == n_layers - 1)
+                mark(f"{li}.down")
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
@@ -4606,6 +4661,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     LY.P_HCA_UP,
                     x_out=ptr(GI, LY.G_FIN_OUT),
                 )
+                mark("final_mix")
+            if const_expr(TL):
+                _dump_tl_names(kernel_name, tl_names)
 
     @flyc.jit
     def launch(

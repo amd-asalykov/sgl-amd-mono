@@ -305,6 +305,10 @@ class VerifyRunner(_Base):
             LY.scratch_layout(4 + 2, r * self.L, r)[1]
             for r in range(1, self.max_reqs + 1)
         )
+        if LY.timeline_enabled():
+            from sgl_amd_mono.common.plan import BLOCKS
+
+            nbytes = max(nbytes, LY.timeline_offset() + LY.timeline_bytes(BLOCKS))
         self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.h_bufs = [torch.empty(S, HC_DIM, **bf16) for _ in range(2)]
@@ -606,6 +610,10 @@ class DraftRunner(_Base):
             for r in range(1, self.max_reqs + 1)
             for t in (1, self.L_ext)
         )
+        if LY.timeline_enabled():
+            from sgl_amd_mono.common.plan import BLOCKS
+
+            nbytes = max(nbytes, LY.timeline_offset() + LY.timeline_bytes(BLOCKS))
         self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.x_buf = torch.empty(S, HIDDEN, **bf16)

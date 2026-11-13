@@ -251,3 +251,25 @@ def scratch_layout(n_layers: int, T: int, R: int = 1):
         add(p + "mtp_h", T * HC_DIM // 2)
         add(p + "mtp_ssq", T * 4 * NPART)
     return regions, off
+
+
+# ---- debug timeline (QWEN38_TIMELINE=1 at build): thread 0 of each CTA stores the
+# 100 MHz clock after every stage into a [CTA][TL_POINTS] int64 row past the mailboxes
+TL_POINTS = 512
+
+
+def timeline_enabled() -> bool:
+    import os
+
+    return os.environ.get("QWEN38_TIMELINE", "0") == "1"
+
+
+def timeline_offset() -> int:
+    """Byte offset of the timeline rows: past every runner's mailboxes."""
+    verify = max(scratch_layout(4 + 2, r * 4, r)[1] for r in range(1, 9))
+    draft = max(scratch_layout(1 + 2, r * t, r)[1] for r in range(1, 9) for t in (1, 4))
+    return padded(max(verify, draft), 4096)
+
+
+def timeline_bytes(blocks: int) -> int:
+    return blocks * TL_POINTS * 8
