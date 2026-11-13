@@ -343,3 +343,82 @@ def test_launches_per_verify_is_the_plan():
 
     kinds = ["qsa" if i % 4 == 3 else "gdn" for i in range(48)]
     assert len(launch_plans(kinds)) == LY.LAUNCHES_PER_VERIFY
+
+
+# ---------------------------------------------------------------- host plumbing
+@pytest.fixture
+def no_capture(monkeypatch):
+    # CPU: no stream is ever capturing
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+
+def _runner(tp, rank, group="g"):
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
+
+    r = object.__new__(R.VerifyRunner)
+    r.tp, r.rank, r.cpu_group, r.geo = tp, rank, group, LY.geom(tp)
+    r._synced, r._kernels = set(), {}
+    return r
+
+
+def test_tp1_runner_passes_no_peers():
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
+
+    r = object.__new__(R.VerifyRunner)
+    assert r.peer_args() == (0, 0, 0) and r.peer is None and r.tp == 1
+    r.refuse_tp_launch()  # TP 1 launches
+    r.compile_in_lockstep(1, ["k"])  # nothing to agree on
+
+
+def test_tp_runner_needs_the_cpu_group():
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
+
+    with pytest.raises(ValueError):
+        R._Base.__init__(object.__new__(R.VerifyRunner), "cpu", 0, None, tp=2, rank=0)
+    with pytest.raises(ValueError):
+        R._Base.__init__(object.__new__(R.VerifyRunner), "cpu", 0, None, tp=2, rank=2,
+                         cpu_group="g")  # fmt: skip
+
+
+@pytest.mark.parametrize("tp,rank,first", [(2, 0, "k0"), (2, 1, "k2"), (4, 3, "k3")])
+def test_compile_in_lockstep(monkeypatch, no_capture, tp, rank, first):
+    import torch.distributed as dist
+
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
+
+    built, barriers = [], []
+    r = _runner(tp, rank)
+    monkeypatch.setattr(R, "compile_only", lambda launch: built.append(launch))
+    monkeypatch.setattr(r, "kernel", lambda key: key, raising=False)
+    monkeypatch.setattr(dist, "barrier", lambda group=None: barriers.append(group))
+    keys = [f"k{i}" for i in range(5)]
+    r.compile_in_lockstep(2, keys)
+    # every key, from this rank's share on, then one barrier on the CPU group
+    assert sorted(built) == keys and built[0] == first and barriers == ["g"]
+    r.compile_in_lockstep(2, keys)  # once a batch size
+    assert len(built) == 5 and len(barriers) == 1
+    with pytest.raises(NotImplementedError):
+        r.refuse_tp_launch()
+
+
+def test_routes_are_agreed_once_a_key(monkeypatch, no_capture):
+    from sgl_amd_mono.qwen38_flash_next import spec as q38
+
+    calls = []
+
+    def agreed(group, ok):
+        calls.append((group, ok))
+        return False  # another rank refuses
+
+    assert q38.agreed(None, True) is True  # TP 1: no collective
+    monkeypatch.setattr(q38, "agreed", agreed)
+    from types import SimpleNamespace as NS
+
+    built = q38._Built(None, NS(cpu_group="g"))
+    key = NS(forward_mode="target_verify", tokens_per_request=4, batch_size=2)
+    assert not built.takes(key) and not built.takes(key)
+    assert calls == [("g", True)]
+    # TP 1: no collective
+    tp1 = q38._Built(None, NS(cpu_group=None))
+    assert tp1.takes(key) and len(calls) == 1
+    assert not tp1.takes(NS(forward_mode="decode", tokens_per_request=1, batch_size=2))

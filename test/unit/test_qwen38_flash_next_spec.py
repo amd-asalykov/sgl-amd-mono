@@ -390,8 +390,10 @@ def test_build_installs_the_wrapper(monkeypatch, caplog):
             pass
 
     monkeypatch.setattr(weights, "param_ptrs", lambda model: {})
-    monkeypatch.setattr(weights, "mtp_views", lambda model, copies, params: {})
+    monkeypatch.setattr(weights, "mtp_views", lambda model, copies, params, tp=1: {})
     monkeypatch.setattr(R, "DraftRunner", _Runner)
+    # TP 1 (no published parallel config here)
+    monkeypatch.setattr(q38, "tp_rank_group", lambda: (1, 0, None))
     layer = SimpleNamespace(rotary_emb=None, attn=SimpleNamespace(layer_id=48))
     lm = _MtpLm()
     lm.model = SimpleNamespace(

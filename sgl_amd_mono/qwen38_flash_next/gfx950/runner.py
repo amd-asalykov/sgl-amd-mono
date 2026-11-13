@@ -144,15 +144,30 @@ PLE_LAUNCH = 1  # the launch whose first layer (1) carries the PLE
 class _Base:
     """The buffers both runners share: scratch mailboxes, the epoch, the tables."""
 
-    # TP size and the rank's shard geometry (``layout.geom``), set by __init__
+    # TP size, this rank, the rank's shard geometry (``layout.geom``) and the peer
+    # buffer (None at TP 1), set by __init__
     tp = 1
+    rank = 0
     geo = LY.geom(1)
+    peer = None
+    cpu_group = None
 
-    def __init__(self, device, eos_token_id: int, fault, tp: int = 1):
+    def __init__(
+        self, device, eos_token_id: int, fault, tp: int = 1, rank: int = 0, cpu_group=None
+    ):
         ensure_writable_flydsl_cache()
         self.device = device
         # the rank's shard geometry (``layout.geom``)
         self.tp, self.geo = int(tp), LY.geom(int(tp))
+        self.rank, self.cpu_group = int(rank), cpu_group
+        if self.tp > 1:
+            if cpu_group is None or not 0 <= self.rank < self.tp:
+                raise ValueError(
+                    f"Qwen3.8-Flash-Next monokernel: TP {self.tp} rank {self.rank} needs "
+                    "the TP group's CPU (gloo) group"
+                )
+            self.peer = self._peer_buffer()
+        self._synced: set = set()  # batch sizes whose launches every rank compiled
         self.eos_token_id = int(eos_token_id)
         self.fault_site, self.fault_after = fault or (0, 0)
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
@@ -177,7 +192,54 @@ class _Base:
         """The launch's (sym, peers, rank) arguments: this rank's peer buffer base,
         the device table of every rank's base, and the rank; zeros at TP 1 (the
         kernel reads none of them)."""
-        return (0, 0, 0)
+        if self.peer is None:
+            return (0, 0, 0)
+        return (self.peer.local, self.peer.addresses.data_ptr(), self.rank)
+
+    def _peer_buffer(self):
+        """The symmetric peer buffer (``layout.peer_layout`` at MAX_T rows, the
+        layout every launch compiles in), zeroed: its construction is a collective
+        handshake of the TP group, so every rank builds its runners in one order
+        (the target's verify runner, then the draft's) with the same sizes."""
+        from sgl_amd_mono.common.peer import PeerBuffer
+
+        nbytes = LY.peer_layout(self.tp, MAX_T)["_bytes"]
+        peer = PeerBuffer(nbytes, self.cpu_group, self.rank, self.tp, self.device)
+        peer.bytes.zero_()
+        return peer
+
+    def compile_in_lockstep(self, R: int, keys) -> None:
+        """TP > 1: at a batch size's first eager step, compile every launch of it
+        (FlyDSL's compile-only mode) and wait for every rank before the first launch.
+
+        A batch size's launches compile lazily at its first forward (the cache
+        strides are compiled in); a rank that finished early would otherwise wait on
+        its peers' first exchange past the guard's deadline (minutes on a cold
+        FlyDSL cache) and stop the server. Each rank starts at its own share of the
+        keys: FlyDSL's disk cache (a lock a kernel) hands it the ones another rank
+        built. The batch sizes come in lockstep (SGLang's scheduler drives every
+        rank through the same steps), so each rank reaches the barrier once a batch
+        size."""
+        if self.tp == 1 or R in self._synced:
+            return
+        import torch.distributed as dist
+
+        no_capture("compiling a new batch size's launches")
+        keys = list(dict.fromkeys(keys))
+        start = len(keys) * self.rank // self.tp
+        for key in keys[start:] + keys[:start]:
+            compile_only(self.kernel(key))
+        dist.barrier(group=self.cpu_group)
+        self._synced.add(R)
+
+    def refuse_tp_launch(self) -> None:
+        """TP > 1 runs no launch yet: the stages are still the TP 1 ones (sharded
+        stages and the in-kernel all-reduce are TP_PLAN commits 4-5)."""
+        if self.tp > 1:
+            raise NotImplementedError(
+                f"Qwen3.8-Flash-Next monokernel: TP {self.tp} launches are not "
+                "implemented yet (sharded stages, in-kernel all-reduce)"
+            )
 
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
@@ -322,8 +384,10 @@ class VerifyRunner(_Base):
         device,
         fault=None,
         tp: int = 1,
+        rank: int = 0,
+        cpu_group=None,
     ):
-        super().__init__(device, eos_token_id, fault, tp)
+        super().__init__(device, eos_token_id, fault, tp, rank, cpu_group)
         self.kinds, self.layers, self.final, self.ngram = kinds, layers, final, ngram
         self.embed_w = embed_w
         self.cos_sin = cos_sin  # () -> SGLang's bf16 RoPE table (a cached cast)
@@ -398,7 +462,9 @@ class VerifyRunner(_Base):
         if reasons:
             raise ValueError("Qwen3.8-Flash-Next monokernel: " + "; ".join(reasons))
         tables, meta = self._tables_for(fb, pos, rtp, kvp, cos, R)
-        return self._keep(key, (tables, self.keys(R, meta)))
+        keys = self.keys(R, meta)
+        self.compile_in_lockstep(R, keys)
+        return self._keep(key, (tables, keys))
 
     def cache_reasons(self, rtp, kvp, R: int) -> list[str]:
         """What the kernel assumes of SGLang's caches for a verify of R requests:
@@ -596,6 +662,7 @@ class VerifyRunner(_Base):
         S = int(fb.batch_size) * self.L
         if S > MAX_T:
             raise ValueError(f"Qwen3.8-Flash-Next monokernel: {S} rows past {MAX_T}")
+        self.refuse_tp_launch()
         tables, keys = self.prepare_step(fb, pos)
         stream = torch.cuda.current_stream()
         h = self.h_bufs[1]  # unused by the prelude launch, which embeds the tokens
@@ -634,8 +701,10 @@ class DraftRunner(_Base):
         device,
         fault=None,
         tp: int = 1,
+        rank: int = 0,
+        cpu_group=None,
     ):
-        super().__init__(device, eos_token_id, fault, tp)
+        super().__init__(device, eos_token_id, fault, tp, rank, cpu_group)
         self.views, self.embed_w, self.cos_sin = views, embed_w, cos_sin
         self.layer_id = layer_id
         self.L_ext, self.max_reqs = int(ntok_extend), int(max_reqs)
@@ -723,11 +792,14 @@ class DraftRunner(_Base):
             first_src="mtp",
             ring=ring_width(kvp),
         )
+        # a draft key a mode and batch size (extend: R x L_ext rows, decode: R x 1)
+        self.compile_in_lockstep((R, S), [build])
         return self._keep(key, (self._upload(rows), build))
 
     def launch(self, fb, hidden_states: torch.Tensor):
         """A draft step -> (the draft mixer's output x [S, HIDDEN], the
         hyper-connection hidden states [S, HC_DIM])."""
+        self.refuse_tp_launch()
         S = int(fb.input_ids.numel())
         if not any(_overlaps(b, hidden_states) for b in self.hc_bufs):
             self.hin_buf[:S].copy_(hidden_states)

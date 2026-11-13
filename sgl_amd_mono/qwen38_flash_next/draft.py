@@ -50,6 +50,8 @@ import logging
 import os
 from typing import Optional
 
+import torch
+
 try:
     from sglang.kernels.plugin_kernels.amd.spec import (
         DeviceLimits,
@@ -127,7 +129,13 @@ SGLANG_READS = {
     ),
     "srt/speculative/draft_utils.py": ('"qsa"',),
     "srt/speculative/*.py": ("hidden_states",),
-    "srt/runtime_context.py": ("get_parallel", '"tp_size"'),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"tp_size"',
+        '"tp_rank"',
+        '"tp_group"',
+    ),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
 }
 
 # The draft runs on its own QSA backends whatever --speculative-draft-attention-backend
@@ -146,9 +154,11 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     from sgl_amd_mono.qwen38_flash_next.gfx950 import weights
 
     reasons = []
-    if get_parallel().tp_size != 1:
-        reasons.append("the draft launch runs the MTP layer on one GPU")
-    return reasons + weights.mtp_reasons(model)
+    tp = get_parallel().tp_size
+    if tp not in target.TP_SIZES:
+        reasons.append(f"the draft launch runs the MTP layer at TP {target.TP_SIZES}")
+        return reasons
+    return reasons + weights.mtp_reasons(model, tp)
 
 
 def _step_backend() -> Optional[str]:
@@ -286,6 +296,22 @@ class _Draft:
         self.backend_checked: set = set()
         on = os.environ.get(DRAFT_HEAD_FP8_ENV, "1") == "1"
         self.head = _DraftHead(lm) if on else None
+        self.routes: dict = {}  # TP > 1: each draft step key's agreed verdict
+
+    def lockstep(self, key, ok: bool) -> bool:
+        """TP > 1: ``ok`` on every rank, agreed at the key's first eager step (every
+        rank runs the same draft steps; a rank-local verdict would desync the
+        launches' epochs and tags). TP 1: ``ok``."""
+        group = getattr(self.runner, "cpu_group", None)
+        if group is None:
+            return ok
+        if key not in self.routes:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"Qwen3.8-Flash-Next MTP draft step {key} first seen in a capture"
+                )
+            self.routes[key] = target.agreed(group, ok)
+        return self.routes[key]
 
     def takes(self, forward_batch, input_embeds=None) -> bool:
         """Whether the launch runs this step: static properties of the step only
@@ -301,12 +327,13 @@ class _Draft:
 
         r, fb = self.runner, forward_batch
         hidden = None if fb.spec_info is None else fb.spec_info.hidden_states
-        if input_embeds is None and draft_eligible(fb, hidden, r.L_ext, r.max_reqs):
-            return True
+        ok = input_embeds is None and draft_eligible(fb, hidden, r.L_ext, r.max_reqs)
         mode, R = fb.forward_mode, int(fb.batch_size)
         is_extend = mode.is_draft_extend_v2()
         if not (is_extend or mode.is_decode()) or not 1 <= R <= r.max_reqs:
-            return False
+            return False  # (draft_eligible takes none of these)
+        if self.lockstep((mode.name, R, int(fb.input_ids.numel())), ok):
+            return True
         if input_embeds is not None:
             what = "input embeddings"
         elif hidden is None:
@@ -421,8 +448,9 @@ def _build(model, hf_config, ctx) -> _Draft:
     from sgl_amd_mono.qwen38_flash_next.gfx950.runner import DraftRunner
 
     _turn_off_mtp_index_share(hf_config)
+    tp, rank, group = target.tp_rank_group()
     params = weights.param_ptrs(model)
-    views = weights.mtp_views(model, ctx.copies, params)
+    views = weights.mtp_views(model, ctx.copies, params, tp)
     layer = model.model.layers[0]
     rope = layer.rotary_emb
     runner = DraftRunner(
@@ -437,6 +465,10 @@ def _build(model, hf_config, ctx) -> _Draft:
         # SGLANG_AMD_MONO_FAULT_INJECT stalls the target's launches only, so the
         # fault-injection test knows which launch stopped
         fault=None,
+        # TP > 1: the second peer buffer handshake, after the target's on every rank
+        tp=tp,
+        rank=rank,
+        cpu_group=group,
     )
     runner.set_deadline(ctx.deadline_s)
     draft = _Draft(model, runner)
@@ -459,7 +491,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(
             widths=tuple(range(1, target.MAX_R * target.TOKENS + 1)),
-            tp_sizes=(target.TP,),
+            tp_sizes=target.TP_SIZES,
             resident_blocks=BLOCKS,
         )
     },

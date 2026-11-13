@@ -69,6 +69,11 @@ logger = logging.getLogger(__name__)
 MAX_R = 8  # requests a launch takes at most (``gfx950/config.MAX_R``)
 TOKENS = 4  # rows a request: NEXTN's 3 draft steps + 1
 TP = 1
+# the TP sizes the launches serve (``DeviceLimits.tp_sizes``); the geometry, the
+# peer buffers and the collective build are laid out for ``config.TP_SIZES``, but
+# the sharded stages and the in-kernel all-reduce are not there yet (TP_PLAN
+# commits 4-5), so TP > 1 stays refused
+TP_SIZES = (TP,)
 # the verify widths: whole requests of 4 rows, up to 8 (32 rows)
 WIDTHS = tuple(range(TOKENS, MAX_R * TOKENS + 1, TOKENS))
 # the kernel's GDN SSM state dtypes (``gfx950/config.MonoBuild.ssm_bf16``)
@@ -158,10 +163,13 @@ SGLANG_READS = {
         "get_parallel",
         "process_model_config",
         '"tp_size"',
+        '"tp_rank"',
+        '"tp_group"',
         '"pp_size"',
         '"attn_cp_size"',
         '"moe_ep_size"',
     ),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/layers/rotary_embedding/base.py": ("cos_sin_cache_as",),
     "srt/layers/vocab_parallel_embedding.py": ("weight",),
     "srt/models/qwen3_5.py": (
@@ -286,11 +294,11 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
 
     m, p = model.model, get_parallel()
     reasons = []
-    widths = (p.tp_size, p.pp_size, p.attn_cp_size, p.moe_ep_size)
-    if widths != (1, 1, 1, 1):
+    widths = (p.pp_size, p.attn_cp_size, p.moe_ep_size)
+    if p.tp_size not in TP_SIZES or widths != (1, 1, 1):
         reasons.append(
             f"TP {p.tp_size} / PP {p.pp_size} / CP {p.attn_cp_size} / EP "
-            f"{p.moe_ep_size}: the launches run the whole model on one GPU"
+            f"{p.moe_ep_size}: the launches run TP {TP_SIZES} without PP, CP or EP"
         )
     if getattr(model, "capture_aux_hidden_states", False):
         reasons.append("auxiliary hidden states (EAGLE3 / DFLASH): none are captured")
@@ -324,12 +332,51 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     return reasons + _context_reason(process_model_config().context_len)
 
 
+def agreed(group, ok: bool) -> bool:
+    """``ok`` on every rank of the TP ``group`` (a CPU group; None at TP 1): a MIN
+    all-reduce, so every rank takes the same route."""
+    if group is None:
+        return ok
+    import torch.distributed as dist
+
+    t = torch.tensor([int(ok)], dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group)
+    return bool(t.item())
+
+
 class _Built:
     """The monokernels: the runner and the forward."""
 
     def __init__(self, lm, runner):
         self.lm, self.runner = lm, runner
         self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
+        # TP > 1: each step key's route, agreed by every rank at its first eager
+        # step (a rank-local route would desync the launches' epochs and tags)
+        self._routes: dict = {}
+
+    def takes(self, key) -> bool:
+        """Whether the launches run a routed step of ``key``; at TP > 1 every rank's
+        verdict, decided at the key's first eager step (graphs replay it)."""
+        ok = (
+            key.forward_mode == "target_verify"
+            and key.tokens_per_request == TOKENS
+            and key.batch_size <= MAX_R
+        )
+        group = getattr(self.runner, "cpu_group", None)
+        if group is None:
+            return ok
+        k = (key.forward_mode, key.tokens_per_request, key.batch_size)
+        if k not in self._routes:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"Qwen3.8-Flash-Next monokernel: step {k} first seen in a capture"
+                )
+            self._routes[k] = agreed(group, ok)
+            if ok and not self._routes[k]:
+                logger.warning(
+                    "Qwen3.8-Flash-Next monokernel: another rank refuses step %s", k
+                )
+        return self._routes[k]
 
     def forward(
         self,
@@ -344,11 +391,7 @@ class _Built:
     ):
         """``Qwen4ExpForConditionalGeneration.forward`` for a routed verify step."""
         lm, key = self.lm, plan.key
-        if (
-            key.forward_mode != "target_verify"
-            or key.tokens_per_request != TOKENS
-            or key.batch_size > MAX_R
-        ):
+        if not self.takes(key):
             # an eager step the launches do not take: SGLang's forward
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, get_embedding, pp_proxy_tensors
@@ -377,6 +420,15 @@ class _Built:
         return out
 
 
+def tp_rank_group() -> tuple:
+    """(TP size, TP rank, the TP group's CPU group or None at TP 1)."""
+    from sglang.srt.runtime_context import get_parallel
+
+    p = get_parallel()
+    tp = int(p.tp_size)
+    return tp, int(p.tp_rank) if tp > 1 else 0, p.tp_group.cpu_group if tp > 1 else None
+
+
 def _build(model, hf_config, ctx) -> _Built:
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.qwen38_flash_next.gfx950 import weights
@@ -386,13 +438,14 @@ def _build(model, hf_config, ctx) -> _Built:
         raise RuntimeError("Qwen3.8-Flash-Next monokernel: build inside a capture")
     t, m = _text(hf_config), model.model
     kinds = _kinds(t)
+    tp, rank, group = tp_rank_group()
     params = weights.param_ptrs(model)
     layers = {
-        i: weights.layer_views(m.layers[i], i, kind, ctx.copies, params)
+        i: weights.layer_views(m.layers[i], i, kind, ctx.copies, params, tp)
         for i, kind in enumerate(kinds)
     }
     final = weights.mixer_views(m.hyper_connection_mixer, ctx.copies, params)
-    ngram = weights.ngram_views(m.layers[1].ple, ctx.copies, params)
+    ngram = weights.ngram_views(m.layers[1].ple, ctx.copies, params, tp)
     rope = m.layers[3].rotary_emb
     runner = VerifyRunner(
         kinds=kinds,
@@ -406,7 +459,12 @@ def _build(model, hf_config, ctx) -> _Built:
         max_reqs=MAX_R,
         eos_token_id=int(t.eos_token_id),
         device=m.embed_tokens.weight.device,
-        fault=guard.fault_injection(0),
+        fault=guard.fault_injection(rank),
+        # TP > 1: the runner's peer buffer handshake is collective; the target's
+        # build runs before the draft's on every rank
+        tp=tp,
+        rank=rank,
+        cpu_group=group,
     )
     runner.set_deadline(ctx.deadline_s)
     built = _Built(model, runner)
@@ -429,7 +487,7 @@ def _build(model, hf_config, ctx) -> _Built:
 SPEC = MonoSpec(
     name="qwen38_flash_next_hip",
     devices={
-        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
     },
     # the launches serve NEXTN target verify steps only
     features=frozenset({Feature.SPECULATIVE_DECODING}),
