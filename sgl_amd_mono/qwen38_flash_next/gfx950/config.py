@@ -23,6 +23,16 @@ GDN_QKVZ = 2 * GDN_KEY_DIM + 2 * GDN_VAL_DIM  # 16384
 N_EXPERTS = 512
 TOPK = 10
 MOE_INTER = 640
+# attention heads of a QSA (full-attention) layer
+QSA_HQ = 24
+QSA_KV = 2
+# vocab-parallel tables: the token embedding / LM head and the PLE n-gram FP8 table
+VOCAB = 248320
+NGRAM_ROWS = 320001536
+# the TP sizes the geometry is laid out for (``layout.geom``): SGLang's attention TP
+# = MoE TP = TP, EP 1. tp 1 is the one GPU layout; tp > 1 per-rank shards of
+# SGLang's TP params (``notes/TP_PLAN.md``)
+TP_SIZES = (1, 2, 4)
 
 # a launch's rows: R requests x L verify tokens (row t: request t // L, step t % L)
 MAX_R = 8
@@ -78,6 +88,9 @@ class MonoBuild(msgspec.Struct, frozen=True):
     # fault_after steps have run
     fault_site: int = 0
     fault_after: int = 0
+    # TP size (``layout.geom``): the per-rank shard geometry is compiled in; the rank
+    # is a kernel argument, so one code object serves every rank
+    tp: int = 1
 
     def __post_init__(self) -> None:
         kinds = self.layers
@@ -92,6 +105,8 @@ class MonoBuild(msgspec.Struct, frozen=True):
             raise ValueError(f"{self.nreq * self.ntok} rows, past {MAX_T}")
         if self.first_src not in ("global", "embed", "mtp"):
             raise ValueError(f"first_src {self.first_src!r}")
+        if self.tp not in TP_SIZES:
+            raise ValueError(f"TP {self.tp}: the geometry is laid out for {TP_SIZES}")
 
     @property
     def layers(self) -> tuple:

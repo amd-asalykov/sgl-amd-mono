@@ -19,8 +19,6 @@ import torch
 from . import layout as LY
 from . import packing
 from .config import (
-    GDN_CONV_DIM,
-    GDN_HV,
     HC_DIM,
     HC_LOWRANK,
     HIDDEN,
@@ -101,18 +99,30 @@ SGLANG_READS = {
     ),
 }
 
-# kernel name -> (SGLang param of the decoder layer, kernel rows, K)
-GDN_PROJ = {
-    "ip": ("linear_attn.in_proj_qkvz", 16384, 2560),
-    "out": ("linear_attn.out_proj", 2560, 6144),
-    "ba": ("linear_attn.in_proj_ba", LY.BA_ROWS, 2560),  # 96 real rows
-}
-# the QSA decoder layer holds qkv_proj / o_proj itself and the QSA indexer as .indexer
-QSA_PROJ = {
-    "qp": ("qkv_proj", LY.QP_RG_QKV * 16, 2560),
-    "qp2": ("indexer.index_qk_proj", LY.QP_ROWS - LY.QP_RG_QKV * 16, 2560),
-    "out": ("o_proj", 2560, 6144),
-}
+def gdn_proj(tp: int = 1) -> dict:
+    """kernel name -> (SGLang param of the decoder layer, kernel rows, K) of a GDN
+    layer at TP ``tp``: in_proj column-parallel, out_proj K-split (row-parallel)."""
+    g = LY.geom(tp)
+    return {
+        "ip": ("linear_attn.in_proj_qkvz", g.QKVZ, 2560),
+        "out": ("linear_attn.out_proj", 2560, g.VAL_DIM),
+        "ba": ("linear_attn.in_proj_ba", g.BA_ROWS, 2560),  # g.BA_REAL real rows
+    }
+
+
+def qsa_proj(tp: int = 1) -> dict:
+    """The same of a QSA layer, which holds qkv_proj / o_proj itself and the QSA
+    indexer (replicated at every TP) as .indexer."""
+    g = LY.geom(tp)
+    return {
+        "qp": ("qkv_proj", g.QP_RG_QKV * 16, 2560),
+        "qp2": ("indexer.index_qk_proj", g.QP_ROWS - g.QP_RG_QKV * 16, 2560),
+        "out": ("o_proj", 2560, g.VAL_DIM),
+    }
+
+
+GDN_PROJ = gdn_proj(1)
+QSA_PROJ = qsa_proj(1)
 
 _BF16, _F32 = torch.bfloat16, torch.float32
 _HC_NAMES = ("attn_hyper_connection", "mlp_hyper_connection")
@@ -132,7 +142,8 @@ def _hc_tensors(prefix: str, inject: bool = True) -> dict:
 # The small tensors of a layer the packers read, by the checkpoint's name in the
 # layer (what ``packing`` takes) -> (SGLang's param path in the decoder layer,
 # shape, accepted dtypes). SGLang's loader drops the checkpoint's ``self_attn.``.
-def _small(kind: str, ple: bool) -> dict:
+def _small(kind: str, ple: bool, tp: int = 1) -> dict:
+    g = LY.geom(tp)
     t = {}
     for hc in _HC_NAMES:
         t.update({k: (k, *v) for k, v in _hc_tensors(hc).items()})
@@ -144,12 +155,13 @@ def _small(kind: str, ple: bool) -> dict:
     )
     if kind == "gdn":
         # A_log, dt_bias and the gated norm are read as f32 (the packers convert)
-        t["linear_attn.A_log"] = ("linear_attn.A_log", (GDN_HV,), (_BF16, _F32))
-        t["linear_attn.dt_bias"] = ("linear_attn.dt_bias", (GDN_HV,), (_BF16, _F32))
+        # (TP: the rank's contiguous value heads)
+        t["linear_attn.A_log"] = ("linear_attn.A_log", (g.HV,), (_BF16, _F32))
+        t["linear_attn.dt_bias"] = ("linear_attn.dt_bias", (g.HV,), (_BF16, _F32))
         t["linear_attn.norm.weight"] = ("linear_attn.norm.weight", (128,), (_BF16, _F32))  # fmt: skip
         t["linear_attn.conv1d.weight"] = (
             "linear_attn.conv1d.weight",
-            (GDN_CONV_DIM, 1, 4),
+            (g.CONV_DIM, 1, 4),  # TP: [q_r | k_r | v_r] channels
             (_BF16,),
         )
     else:
@@ -203,8 +215,9 @@ def _tensor_reason(t, shape, dtypes, what: str) -> Optional[str]:
     return None
 
 
-def moe_reasons(experts) -> list[str]:
-    """What the kernel assumes of SGLang's MXFP4 FusedMoE params."""
+def moe_reasons(experts, tp: int = 1) -> list[str]:
+    """What the kernel assumes of SGLang's MXFP4 FusedMoE params (at TP, every
+    expert's rank chunk of the intermediate, AITER-padded)."""
     reasons = []
     if getattr(experts, "num_fused_shared_experts", 0) != 1:
         reasons.append(
@@ -215,12 +228,13 @@ def moe_reasons(experts) -> list[str]:
     if activation not in (None, "silu"):
         # SiTU reorders w13 into AITER's gate / up interleaved layout
         reasons.append(f"expert activation {activation!r}, the kernel runs silu")
-    E, IP = N_EXPERTS + 1, LY.MOE_INTER_PAD
+    g = LY.geom(tp)
+    E, IP = N_EXPERTS + 1, g.MOE_INTER_PAD
     for name, shape in (
         ("w13_weight", (E, 2 * IP, HIDDEN // 2)),
         ("w2_weight", (E, HIDDEN, IP // 2)),
         ("w13_weight_scale", (E, 2 * IP, LY.GU_SGROUPS)),
-        ("w2_weight_scale", (E, HIDDEN, LY.DN_SGROUPS)),
+        ("w2_weight_scale", (E, HIDDEN, g.DN_SGROUPS)),
     ):
         t = _get(experts, name)
         # the scales are E8M0 bytes, whichever 1-byte dtype holds them
@@ -274,21 +288,22 @@ def proj_reasons(layer, table: dict) -> list[str]:
     return reasons
 
 
-def small_reasons(layer, kind: str, ple: bool) -> list[str]:
+def small_reasons(layer, kind: str, ple: bool, tp: int = 1) -> list[str]:
     return [
         why
-        for _, (path, shape, dtypes) in _small(kind, ple).items()
+        for _, (path, shape, dtypes) in _small(kind, ple, tp).items()
         if (why := _tensor_reason(_get(layer, path), shape, dtypes, path)) is not None
     ]
 
 
-def layer_reasons(layer, i: int, kind: str) -> list[str]:
-    """Every assumption the kernel makes of decoder layer ``i`` (a ``kind`` layer),
-    as "layer i: ..." reasons; none raises."""
+def layer_reasons(layer, i: int, kind: str, tp: int = 1) -> list[str]:
+    """Every assumption the kernel makes of decoder layer ``i`` (a ``kind`` layer)
+    on a rank of TP ``tp``, as "layer i: ..." reasons; none raises."""
     mlp = getattr(layer, "mlp", None)
-    reasons = moe_reasons(getattr(mlp, "experts", None))
-    reasons += proj_reasons(layer, GDN_PROJ if kind == "gdn" else QSA_PROJ)
-    reasons += small_reasons(layer, kind, ple=getattr(layer, "ple", None) is not None)
+    reasons = moe_reasons(getattr(mlp, "experts", None), tp)
+    reasons += proj_reasons(layer, gdn_proj(tp) if kind == "gdn" else qsa_proj(tp))
+    ple = getattr(layer, "ple", None) is not None
+    reasons += small_reasons(layer, kind, ple=ple, tp=tp)
     return [f"layer {i}: {why}" for why in reasons]
 
 
@@ -303,7 +318,7 @@ def mixer_reasons(mixer) -> list[str]:
 
 
 # ---------------------------------------------------------------- views
-def moe_params(experts) -> dict:
+def moe_params(experts, tp: int = 1) -> dict:
     """SGLang's FusedMoE params (AITER MXFP4 layout), read in place."""
     m = {
         "gu": experts.w13_weight.data,
@@ -311,7 +326,7 @@ def moe_params(experts) -> dict:
         "dn": experts.w2_weight.data,
         "dn_s": experts.w2_weight_scale.data.view(torch.uint8),
     }
-    packing.check_moe_params(m)
+    packing.check_moe_params(m, tp)
     return m
 
 
@@ -348,10 +363,10 @@ def proj_params(layer, table: dict) -> dict:
     return out
 
 
-def checkpoint_dict(layer, kind: str, ple: bool) -> dict:
+def checkpoint_dict(layer, kind: str, ple: bool, tp: int = 1) -> dict:
     """The layer's small tensors by their checkpoint names in the layer, as the
     packers take them: SGLang's params, read in place."""
-    return {ck: _get(layer, path) for ck, (path, _, _) in _small(kind, ple).items()}
+    return {ck: _get(layer, path) for ck, (path, _, _) in _small(kind, ple, tp).items()}
 
 
 def _log_copies(copies: dict, kind: str, ids: tuple, packed, params: set) -> None:
@@ -371,13 +386,16 @@ def param_ptrs(model) -> set:
     return {p.data_ptr() for p in model.parameters()}
 
 
-def layer_views(layer, i: int, kind: str, copies: dict, params: set) -> dict:
+def layer_views(
+    layer, i: int, kind: str, copies: dict, params: set, tp: int = 1
+) -> dict:
     """Decoder layer ``i``'s packed views (``packing.pack_gdn_layer`` /
-    ``pack_qsa_layer``), with its PLE views under "ple" when it carries PLE."""
+    ``pack_qsa_layer``), with its PLE views under "ple" when it carries PLE; at TP
+    ``tp`` the rank's shards SGLang holds, read in place as at TP 1."""
     ple = getattr(layer, "ple", None) is not None
-    lw = checkpoint_dict(layer, kind, ple)
-    moe = moe_params(layer.mlp.experts)
-    proj = proj_params(layer, GDN_PROJ if kind == "gdn" else QSA_PROJ)
+    lw = checkpoint_dict(layer, kind, ple, tp)
+    moe = moe_params(layer.mlp.experts, tp)
+    proj = proj_params(layer, gdn_proj(tp) if kind == "gdn" else qsa_proj(tp))
     if kind == "gdn":
         views = packing.pack_gdn_layer(lw, moe=moe, proj=proj)
     else:
@@ -401,10 +419,11 @@ def mixer_views(mixer, copies: dict, params: set) -> dict:
     return views
 
 
-def ngram_views(ple_layer, copies: dict, params: set) -> dict:
+def ngram_views(ple_layer, copies: dict, params: set, tp: int = 1) -> dict:
     """Layer 1's PLE n-gram embedding: the FP8 table and its scale in place, and the
     int64 metadata (layer multipliers, per-head vocab sizes and offsets) as one
-    table."""
+    table; at TP the table is the rank's vocab shard, from row "start" of the
+    global table (SGLang's ``shard_indices.org_vocab_start_index``)."""
     emb = ple_layer.ple_embedding
     meta = (
         torch.cat(
@@ -422,12 +441,19 @@ def ngram_views(ple_layer, copies: dict, params: set) -> dict:
         "meta": meta,
         "table": emb.ngram_embedding.weight,
         "scale": emb.ngram_embedding.weight_scale,
+        "start": ngram_shard_start(emb.ngram_embedding) if tp > 1 else 0,
     }
 
 
-def ngram_reasons(ple_layer) -> list[str]:
+def ngram_shard_start(ngram_embedding) -> int:
+    """The global row of a vocab shard's row 0 (SGLang's VocabParallelEmbedding)."""
+    return int(ngram_embedding.shard_indices.org_vocab_start_index)
+
+
+def ngram_reasons(ple_layer, tp: int = 1) -> list[str]:
     emb = getattr(ple_layer, "ple_embedding", None)
-    table = getattr(getattr(emb, "ngram_embedding", None), "weight", None)
+    ngram = getattr(emb, "ngram_embedding", None)
+    table = getattr(ngram, "weight", None)
     reasons = []
     if not isinstance(table, torch.Tensor) or table.dtype != torch.float8_e4m3fn:
         reasons.append(
@@ -439,6 +465,15 @@ def ngram_reasons(ple_layer) -> list[str]:
             f"{table.device}, the kernel reads it as a device pointer [n, "
             f"{LY.NGRAM_DIM}] (no --ple-offload-embedding)"
         )
+    elif tp > 1:
+        # a vocab shard indexed with global ids would read out of bounds
+        rows = LY.geom(tp).NGRAM_ROWS
+        start = getattr(getattr(ngram, "shard_indices", None), "org_vocab_start_index", None)  # fmt: skip
+        if table.shape[0] != rows or start is None or start % rows:
+            reasons.append(
+                f"layer 1: the PLE n-gram table shard is {tuple(table.shape)} from "
+                f"row {start}, the kernel reads a TP {tp} vocab shard of {rows} rows"
+            )
     return reasons
 
 
@@ -451,13 +486,13 @@ _MTP_FUSION = {
 }
 
 
-def mtp_reasons(lm) -> list[str]:
+def mtp_reasons(lm, tp: int = 1) -> list[str]:
     """What the draft launch assumes of SGLang's ``Qwen4ExpForCausalLMMTP``: its QSA
     layer, its input fusion (separate embedding / hidden projections) and its mixer."""
     layers = getattr(getattr(lm, "model", None), "layers", None)
     if layers is None or len(layers) != 1:
         return ["the MTP draft must hold one decoder layer"]
-    reasons = layer_reasons(layers[0], 0, "qsa")
+    reasons = layer_reasons(layers[0], 0, "qsa", tp)
     reasons += [
         f"MTP input fusion: {why}"
         for name, shape in _MTP_FUSION.items()
@@ -467,16 +502,18 @@ def mtp_reasons(lm) -> list[str]:
     return reasons
 
 
-def mtp_views(lm, copies: dict, params: set) -> dict:
+def mtp_views(lm, copies: dict, params: set, tp: int = 1) -> dict:
     """The MTP draft's packed views (``packing.pack_mtp``)."""
     layer = lm.model.layers[0]
-    lw = {f"layers.0.{k}": v for k, v in checkpoint_dict(layer, "qsa", False).items()}
+    lw = {
+        f"layers.0.{k}": v for k, v in checkpoint_dict(layer, "qsa", False, tp).items()
+    }
     lw.update({name: _get(lm, name) for name in _MTP_FUSION})
     mixer = lm.model.hyper_connection_mixer
     for name in ("hc_norm", "input_mix_weight_down", "input_mix_weight_up"):
         lw[f"hyper_connection_mixer.{name}.weight"] = _get(mixer, f"{name}.weight")
     views = packing.pack_mtp(
-        lw, moe=moe_params(layer.mlp.experts), proj=proj_params(layer, QSA_PROJ)
+        lw, moe=moe_params(layer.mlp.experts, tp), proj=proj_params(layer, qsa_proj(tp))
     )
     _log_copies(copies, "mtp packed", (), views, params)
     return views

@@ -222,11 +222,16 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     issm_row, ple_ist_row, ictx_row = key.issm_row, key.ple_ist_row, key.ictx_row
     iconv_strides = (key.iconv.step, key.iconv.channel, key.iconv.window, key.iconv.row)
     fault_site, fault_after = key.fault_site, key.fault_after
+    # TP: the rank's shard geometry (``layout.geom``); the rank is a kernel argument.
+    # The stages still run the TP 1 shapes (the sharded stages are TP_PLAN commit 4),
+    # so a TP > 1 build serves the plumbing (compile) tests only: the runners refuse
+    # to launch it.
+    TPW = key.tp
     R, L = nreq, ntok
     NT = R * L
     assert 1 <= R <= MAX_R and 1 <= NT <= MAX_T
     n_layers = len(plan)
-    regions, _ = scratch_layout(n_layers + 2, NT, R)
+    regions, _ = scratch_layout(n_layers + 2, NT, R, TPW)
     G = BLOCKS
     NCT = (NT + 15) // 16  # MFMA column tiles of the S rows
     KPH = LY.kphases(NT)  # K phases of the K=2560 activation GEMMs
@@ -371,6 +376,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
         p="".join(k[0] for k in plan),
         f=int(final_mix),
         b=int(ssm_bf16),
+        **({"t": TPW} if TPW > 1 else {}),
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])

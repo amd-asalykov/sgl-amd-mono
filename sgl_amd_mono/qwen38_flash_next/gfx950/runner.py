@@ -35,7 +35,7 @@ from sgl_amd_mono.common import guard
 
 from . import layout as LY
 from . import packing
-from .config import GDN_CONV_DIM, HC_DIM, HIDDEN, MAX_T, ConvStrides, MonoBuild
+from .config import HC_DIM, HIDDEN, MAX_T, ConvStrides, MonoBuild
 
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -144,9 +144,15 @@ PLE_LAUNCH = 1  # the launch whose first layer (1) carries the PLE
 class _Base:
     """The buffers both runners share: scratch mailboxes, the epoch, the tables."""
 
-    def __init__(self, device, eos_token_id: int, fault):
+    # TP size and the rank's shard geometry (``layout.geom``), set by __init__
+    tp = 1
+    geo = LY.geom(1)
+
+    def __init__(self, device, eos_token_id: int, fault, tp: int = 1):
         ensure_writable_flydsl_cache()
         self.device = device
+        # the rank's shard geometry (``layout.geom``)
+        self.tp, self.geo = int(tp), LY.geom(int(tp))
         self.eos_token_id = int(eos_token_id)
         self.fault_site, self.fault_after = fault or (0, 0)
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
@@ -218,6 +224,7 @@ class _Base:
             eos_token_id=self.eos_token_id,
             fault_site=self.fault_site,
             fault_after=self.fault_after,
+            tp=self.tp,
             **kw,
         )
 
@@ -265,8 +272,9 @@ def ring_width(kvp) -> int:
     return kvp.qsa_rope_position_buffer.shape[0] // kvp.qsa_num_request_slots
 
 
-def qsa_cache_reasons(kvp, layer_id: int) -> list[str]:
+def qsa_cache_reasons(kvp, layer_id: int, tp: int = 1) -> list[str]:
     k_buf, v_buf, ring, comp = _qsa_buffers(kvp, layer_id)
+    kv = LY.geom(tp).KV  # the rank's KV heads (TP: max(1, 2 // tp))
     reasons = []
     # 4 slots (one group): a verify row past the pending group overwrites one of its
     # members, and a rejected row's key stays there, so the group can later compress
@@ -275,10 +283,10 @@ def qsa_cache_reasons(kvp, layer_id: int) -> list[str]:
     if ring_width(kvp) not in (4, 8):
         reasons.append(f"an index-key ring of {ring_width(kvp)} slots a request")
     for name, b in (("K", k_buf), ("V", v_buf)):  # 64-bit addressed (any pool size)
-        if b.dtype != torch.bfloat16 or not b.is_contiguous() or b.shape[-2:] != (2, 256):  # fmt: skip
+        if b.dtype != torch.bfloat16 or not b.is_contiguous() or b.shape[-2:] != (kv, 256):  # fmt: skip
             reasons.append(
                 f"layer {layer_id}: the {name} cache is {b.dtype} "
-                f"{tuple(b.shape)}, the kernel writes contiguous bf16 [slots, 2, 256]"
+                f"{tuple(b.shape)}, the kernel writes contiguous bf16 [slots, {kv}, 256]"
             )
     for name, b in (("index-key ring", ring), ("compressed index keys", comp)):
         if not b.is_contiguous() or b.numel() * b.element_size() >= 2**32:
@@ -307,8 +315,9 @@ class VerifyRunner(_Base):
         eos_token_id: int,
         device,
         fault=None,
+        tp: int = 1,
     ):
-        super().__init__(device, eos_token_id, fault)
+        super().__init__(device, eos_token_id, fault, tp)
         self.kinds, self.layers, self.final, self.ngram = kinds, layers, final, ngram
         self.embed_w = embed_w
         self.cos_sin = cos_sin  # () -> SGLang's bf16 RoPE table (a cached cast)
@@ -318,7 +327,7 @@ class VerifyRunner(_Base):
         # one scratch for every R: a launch only accepts pairs tagged with its own
         # (step, launch) epoch
         nbytes = max(
-            LY.scratch_layout(4 + 2, r * self.L, r)[1]
+            LY.scratch_layout(4 + 2, r * self.L, r, self.tp)[1]
             for r in range(1, self.max_reqs + 1)
         )
         if LY.timeline_enabled():
@@ -412,7 +421,7 @@ class VerifyRunner(_Base):
         ssm_dtypes = set()
         for layer_id, kind in enumerate(self.kinds):
             if kind == "qsa":
-                reasons += qsa_cache_reasons(kvp, layer_id)
+                reasons += qsa_cache_reasons(kvp, layer_id, self.tp)
                 continue
             cache = gdn_cache(kvp, layer_id)
             conv, ssm = cache.conv[0], cache.temporal
@@ -420,22 +429,22 @@ class VerifyRunner(_Base):
             if (
                 conv.dtype != torch.bfloat16
                 or not conv.is_contiguous()
-                or conv[0].numel() * 2 != LY.CONV_SLOT_BYTES
+                or conv[0].numel() * 2 != self.geo.CONV_SLOT_BYTES
             ):
                 reasons.append(
                     f"layer {layer_id}: the conv state is {conv.dtype} "
                     f"{tuple(conv.shape)}, the kernel reads contiguous bf16 "
-                    f"[slots, {GDN_CONV_DIM}, 3]"
+                    f"[slots, {self.geo.CONV_DIM}, 3]"
                 )
             if (
                 ssm.dtype not in (torch.float32, torch.bfloat16)
                 or not ssm.is_contiguous()
-                or ssm[0].numel() * 4 != LY.SSM_SLOT_BYTES
+                or ssm[0].numel() * 4 != self.geo.SSM_SLOT_BYTES
             ):
                 reasons.append(
                     f"layer {layer_id}: the SSM state is {ssm.dtype} "
                     f"{tuple(ssm.shape)}, the kernel reads contiguous f32 or bf16 "
-                    "[slots, 48, 128, 128]"
+                    f"[slots, {self.geo.HV}, 128, 128]"
                 )
             issm = cache.intermediate_ssm
             icw = cache.intermediate_conv_window
@@ -530,7 +539,9 @@ class VerifyRunner(_Base):
             for layer_id in layer_ids:
                 t = self.layers[layer_id]
                 if self.kinds[layer_id] == "qsa":
-                    rows.append(packing.qsa_ptr_row(t, *_qsa_buffers(kvp, layer_id)))
+                    rows.append(
+                        packing.qsa_ptr_row(t, *_qsa_buffers(kvp, layer_id), self.tp)
+                    )
                     continue
                 cache = gdn_cache(kvp, layer_id)
                 conv, ssm = cache.conv[0], cache.temporal
@@ -615,14 +626,15 @@ class DraftRunner(_Base):
         eos_token_id: int,
         device,
         fault=None,
+        tp: int = 1,
     ):
-        super().__init__(device, eos_token_id, fault)
+        super().__init__(device, eos_token_id, fault, tp)
         self.views, self.embed_w, self.cos_sin = views, embed_w, cos_sin
         self.layer_id = layer_id
         self.L_ext, self.max_reqs = int(ntok_extend), int(max_reqs)
         S = self.max_reqs * self.L_ext
         nbytes = max(
-            LY.scratch_layout(1 + 2, r * t, r)[1]
+            LY.scratch_layout(1 + 2, r * t, r, self.tp)[1]
             for r in range(1, self.max_reqs + 1)
             for t in (1, self.L_ext)
         )
@@ -672,7 +684,7 @@ class DraftRunner(_Base):
         no_capture("building the pointer tables")
         self._hold(cos)
         reasons = _step_reasons(fb, fb.positions, R, S // R)
-        reasons += qsa_cache_reasons(kvp, self.layer_id)
+        reasons += qsa_cache_reasons(kvp, self.layer_id, self.tp)
         if reasons:
             raise ValueError("Qwen3.8-Flash-Next monokernel: " + "; ".join(reasons))
         g = packing.global_ptr_row(
@@ -690,7 +702,9 @@ class DraftRunner(_Base):
         g[LY.G_MTP_HIN] = hidden_states.data_ptr()
         g[LY.G_FIN_OUT] = self.x_buf.data_ptr()
         g[LY.G_HOUT_SSQ] = self.ssq_buf.data_ptr()
-        rows = packing.mtp_rows(self.views, *_qsa_buffers(kvp, self.layer_id), g)
+        rows = packing.mtp_rows(
+            self.views, *_qsa_buffers(kvp, self.layer_id), g, self.tp
+        )
         pos = fb.positions
         build = self._build_key(
             plan="qsa",

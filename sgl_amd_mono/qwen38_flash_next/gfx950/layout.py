@@ -5,9 +5,15 @@ launch, kept free of FlyDSL so it is testable without a GPU.
 A launch serves R requests x L verify tokens = S rows (S <= 32). Every activation
 mailbox is row-major [S][n], row t = request t // L, draft step t % L."""
 
-from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, padded
+import dataclasses
+import functools
+
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, Shard, padded
 
 from .config import (
+    GDN_DK,
+    GDN_DV,
+    GDN_HK,
     GDN_HV,
     GDN_QKVZ,
     HC_DIM,
@@ -15,7 +21,12 @@ from .config import (
     HIDDEN,
     MOE_INTER,
     N_EXPERTS,
+    NGRAM_ROWS,
+    QSA_HQ,
+    QSA_KV,
     TOPK,
+    TP_SIZES,
+    VOCAB,
 )
 
 assert (BLOCKS, THREADS, WAVES) == (256, 512, 8)  # one CTA per MI355X CU, co-resident
@@ -36,20 +47,25 @@ IP_RG_MAIN = GDN_QKVZ // 16  # 1024 = 4 per CTA; the core tasks compute the b/a 
 MAX_CORE_SPLIT = 8  # the scratch's bound on core_split
 
 
-def core_split(T):
-    """V-row splits per value head of the GDN core: 4 for every T (8 would need 384
-    CTAs)."""
-    return 4
+def core_split(T, tp=1):
+    """V-row splits per value head of the GDN core: 4 a TP rank for every T, so the
+    core keeps 192 tasks at every TP (8 at TP 1 would need 384 CTAs)."""
+    return 4 * tp
 
 
-def core_geom(split):
+def max_core_split(tp=1):
+    """The scratch's bound on core_split (its ssq / og_amax partials a row)."""
+    return max(MAX_CORE_SPLIT, core_split(0, tp))
+
+
+def core_geom(split, hv=GDN_HV):
     """(V rows per task, tasks, threads per V row, K elements per thread, xor offsets
-    of a row reduce) of the GDN core at ``split``."""
+    of a row reduce) of the GDN core at ``split`` over ``hv`` value heads."""
     rows = 128 // split
     rpt = 512 // rows
     kpt = 128 // rpt  # state words per thread
     red_offs = tuple(rpt >> k for k in range(1, rpt.bit_length()))
-    return rows, GDN_HV * split, rpt, kpt, red_offs
+    return rows, hv * split, rpt, kpt, red_offs
 
 
 OUT_RG = HIDDEN // 16  # 160
@@ -139,17 +155,18 @@ PREP_IDX_CTA0 = 26
 MIXA_BASE = DN_RG  # mix-a down past the MoE combine's CTAs [0, 160)
 
 
-def op_base(kind, T):
+def op_base(kind, T, tp=1):
     """out_proj / o_proj base: past the GDN core's CTAs [0, C_TASKS) (192) for T > 4
     (at T = 4, CTA 0 measured faster), or past the QSA merge's last round."""
+    g = geom(tp)
     if kind == "gdn":
-        return GDN_HV * core_split(T) if T > 4 else 0
-    return (T * MERGE_TASKS) % 256
+        return g.HV * core_split(T, tp) if T > 4 else 0
+    return (T * g.MERGE_TASKS) % 256
 
 
-def mixm_base(kind, T):
+def mixm_base(kind, T, tp=1):
     """mix-m down base: past out_proj."""
-    return (op_base(kind, T) + OUT_RG) % 256
+    return (op_base(kind, T, tp) + OUT_RG) % 256
 
 
 # QSA prep tasks start at CTA PREP_BASE (past the CTAs [0, 104) with a 4th qsa_proj
@@ -259,9 +276,11 @@ SSM_STEP_WORDS = 48 * 128 * 128
 LAUNCH_SLOTS = 64  # tag = step * LAUNCH_SLOTS + launch_id + 1
 
 
-def scratch_layout(n_layers: int, T: int, R: int = 1):
+def scratch_layout(n_layers: int, T: int, R: int = 1, tp: int = 1):
     """Byte offsets of every tagged-pair mailbox, one region per (layer, stage), and
-    the total size. T = rows, R = requests."""
+    the total size. T = rows, R = requests, tp: the rank's shard geometry (the
+    replicated stages' regions do not depend on it)."""
+    g = geom(tp)
     regions = {}
     off = 0
 
@@ -272,9 +291,9 @@ def scratch_layout(n_layers: int, T: int, R: int = 1):
 
     for layer in range(n_layers):
         p = f"L{layer}."
-        add(p + "qp", T * QP_ROWS // 2)
-        add(p + "q", T * 24 * 256 // 2)
-        add(p + "kvnew", T * 1024 // 2)
+        add(p + "qp", T * g.QP_ROWS // 2)
+        add(p + "q", T * g.HQ * 256 // 2)
+        add(p + "kvnew", T * g.KV * 512 // 2)  # k 256 + v 256 a local kv head
         add(p + "qi", T * 512 // 2)
         add(p + "cnew", R * cnew_slots(T // R) * 64)  # [R][CN][64]
         add(p + "ilog", T * MAX_BLOCKS)
@@ -282,8 +301,8 @@ def scratch_layout(n_layers: int, T: int, R: int = 1):
         # per (token, segment): key bits of the segment's top-512
         add(p + "cand_k", T * NSEG_MAX * 512)
         add(p + "cand_bl", T * NSEG_MAX * 512 * 2)  # (block, KV loc)
-        add(p + "part", T * ATT_TASKS * PART_STRIDE)
-        add(p + "og", T * 24 * 256 // 2)
+        add(p + "part", T * ATT_TASKS * g.PART_STRIDE)
+        add(p + "og", T * g.HQ * 256 // 2)
         add(p + "ple_kv", T * PLE_ROWS // 2)
         add(p + "ple_h", T * HC_DIM // 2)
         add(p + "ple_ssq", T * 4 * PLE_PARTS)
@@ -291,19 +310,19 @@ def scratch_layout(n_layers: int, T: int, R: int = 1):
             add(p + hc + ".mixd", MIX_KSPLIT * T * HC_LOWRANK)
             add(p + hc + ".mixx", T * HIDDEN // 2)  # bf16 pairs
             add(p + hc + ".injp", MIX_KSPLIT * T * 4)
-        add(p + "ip", T * IP_ROWS // 2)  # bf16 pairs
+        add(p + "ip", T * g.IP_ROWS // 2)  # bf16 pairs
         # per (token, head, split) sum of squares of the GDN output
-        add(p + "ssq", T * GDN_HV * MAX_CORE_SPLIT)
+        add(p + "ssq", T * g.HV * g.MAX_CORE_SPLIT)
         # per (row, producer task) max |og| (the FP8 activation scale)
-        add(p + "og_amax", T * GDN_HV * MAX_CORE_SPLIT)
+        add(p + "og_amax", T * g.HV * g.MAX_CORE_SPLIT)
         add(p + "h1", T * HC_DIM // 2)  # bf16 pairs
         add(p + "h1ssq", T * 4 * NPART)
         add(p + "logit", T * ROUTER_ROWS)  # f32
-        # (row, expert) pairs p = t * 11 + rank: bf16 h = silu(g) * u [p][640], and
-        # under gu_kphases 2 the f32 K-half-0 gate/up partials [p][1280]
-        add(p + "mid", MOE_PAIR * T * MOE_INTER // 2)
+        # (row, expert) pairs p = t * 11 + rank: bf16 h = silu(g) * u [p][I], and
+        # under gu_kphases 2 the f32 K-half-0 gate/up partials [p][2 I]
+        add(p + "mid", MOE_PAIR * T * g.MOE_INTER // 2)
         if gu_kphases(T) == 2:
-            add(p + "gupart", MOE_PAIR * T * 2 * MOE_INTER)
+            add(p + "gupart", MOE_PAIR * T * 2 * g.MOE_INTER)
         add(p + "dpart", max_groups(T, dn_sg(T)) * T * HIDDEN)  # f32 [group][T][2560]
         add(p + "h2", T * HC_DIM // 2)  # bf16 pairs
         add(p + "h2ssq", T * 4 * NPART)
@@ -325,7 +344,8 @@ def timeline_enabled() -> bool:
 
 
 def timeline_offset() -> int:
-    """Byte offset of the timeline rows: past every runner's mailboxes."""
+    """Byte offset of the timeline rows: past every runner's mailboxes (at any TP:
+    the per-rank geometry only shrinks them)."""
     verify = max(scratch_layout(4 + 2, r * 4, r)[1] for r in range(1, 9))
     draft = max(scratch_layout(1 + 2, r * t, r)[1] for r in range(1, 9) for t in (1, 4))
     return padded(max(verify, draft), 4096)
@@ -333,3 +353,124 @@ def timeline_offset() -> int:
 
 def timeline_bytes(blocks: int) -> int:
     return blocks * TL_POINTS * 8
+
+
+# ---- per-rank geometry at TP (``notes/TP_PLAN.md`` section 1): SGLang's TP shards
+@dataclasses.dataclass(frozen=True)
+class Geom:
+    """The shapes one TP rank holds, laid out as SGLang shards them (attention TP =
+    MoE TP = tp, EP 1): GDN heads, QSA q heads and KV head, and the MoE
+    intermediate are split; the hyper-connection mixers, router, QSA indexer and
+    PLE projections are replicated (their constants are the module-level ones).
+    The module-level constants of the sharded quantities are ``geom(1)``'s."""
+
+    tp: int
+    # Gated DeltaNet: contiguous k / v head ranges (local v j -> local k j // 3)
+    HK: int
+    HV: int
+    KEY_DIM: int
+    VAL_DIM: int  # also out_proj's (and the QSA o_proj's) K
+    CONV_DIM: int  # [q_r | k_r | v_r] channels
+    QKVZ: int  # in_proj_qkvz rows [q_r | k_r | v_r | z_r]
+    IP_ROWS: int  # + b / a rows
+    IP_RG_MAIN: int
+    BA_REAL: int  # in_proj_ba rows (b then a)
+    BA_ROWS: int  # the kernel's zero-padded, shuffled copy
+    MAX_CORE_SPLIT: int
+    CONV_SLOT_BYTES: int
+    SSM_SLOT_BYTES: int
+    SSM_STEP_WORDS: int
+    # QSA: q heads [r HQ, (r + 1) HQ); KV heads (TP 4: head r // 2, replicated in pairs)
+    HQ: int
+    KV: int
+    QP_RG_QKV: int  # qkv_proj rows / 16: [HQ x (q 256 | gate 256) | k 256 KV | v 256 KV]
+    QP_ROWS: int  # + the replicated indexer's 640 rows
+    QP_RG: int
+    QP_K_OFF: int
+    QP_V_OFF: int
+    QP_IDX_OFF: int
+    PART_STRIDE: int
+    MERGE_TASKS: int
+    PREP_Q_TASKS: int
+    PREP_K_CTA: int
+    PREP_IDX_CTA0: int
+    PREP_BASE: int
+    SCORES_BASE: int
+    # MoE: every expert (and the shared one) at intermediate I / tp, AITER-padded
+    MOE_INTER: int
+    MOE_INTER_PAD: int
+    GU_PAIRS: int
+    UP_TILE0: int
+    GU_BYTES: int
+    GU_SBYTES: int
+    DN_BYTES: int
+    DN_SGROUPS: int
+    DN_SBYTES: int
+    # vocab-parallel tables
+    VOCAB: int
+    NGRAM_ROWS: int
+
+
+@functools.cache
+def geom(tp: int = 1) -> Geom:
+    """Rank geometry at TP ``tp`` (``config.TP_SIZES``)."""
+    if tp not in TP_SIZES:
+        raise ValueError(f"TP {tp}: the geometry is laid out for {TP_SIZES}")
+    sh = Shard(tp)
+    hk, hv = sh.split(GDN_HK, "GDN key heads"), sh.split(GDN_HV, "GDN value heads")
+    key_dim, val_dim = hk * GDN_DK, hv * GDN_DV
+    qkvz = 2 * key_dim + 2 * val_dim
+    hq = sh.split(QSA_HQ, "QSA q heads")
+    kv = max(1, QSA_KV // tp)  # SGLang's get_num_kv_heads
+    qp_qkv = hq * 512 + 2 * 256 * kv
+    qp_rows = qp_qkv + 640
+    prep_k = hq
+    prep_idx = prep_k + kv
+    prep_base = qp_rows // 16 % 256
+    inter = sh.split(MOE_INTER, "MoE intermediate")
+    # get_moe_weight_sizes(is_aiter_moe): the packed w2 K aligned to 128 bytes
+    ip = padded(inter, 256)
+    dn_sg = (ip // 32 + 7) // 8 * 8
+    return Geom(
+        tp=tp,
+        HK=hk,
+        HV=hv,
+        KEY_DIM=key_dim,
+        VAL_DIM=val_dim,
+        CONV_DIM=2 * key_dim + val_dim,
+        QKVZ=qkvz,
+        IP_ROWS=qkvz + 2 * hv,
+        IP_RG_MAIN=qkvz // 16,
+        BA_REAL=2 * hv,
+        BA_ROWS=padded(2 * hv, 64),
+        MAX_CORE_SPLIT=max_core_split(tp),
+        CONV_SLOT_BYTES=(2 * key_dim + val_dim) * 3 * 2,
+        SSM_SLOT_BYTES=hv * GDN_DK * GDN_DV * 4,
+        SSM_STEP_WORDS=hv * GDN_DK * GDN_DV,
+        HQ=hq,
+        KV=kv,
+        QP_RG_QKV=qp_qkv // 16,
+        QP_ROWS=qp_rows,
+        QP_RG=qp_rows // 16,
+        QP_K_OFF=hq * 512,
+        QP_V_OFF=hq * 512 + 256 * kv,
+        QP_IDX_OFF=hq * 512 + 512 * kv,
+        PART_STRIDE=hq * 256 + 2 * hq,
+        MERGE_TASKS=hq,
+        PREP_Q_TASKS=hq,
+        PREP_K_CTA=prep_k,
+        PREP_IDX_CTA0=prep_idx,
+        PREP_BASE=prep_base,
+        SCORES_BASE=prep_base + prep_idx + 8,
+        MOE_INTER=inter,
+        MOE_INTER_PAD=ip,
+        GU_PAIRS=inter // 16,
+        UP_TILE0=ip // 16,
+        GU_BYTES=2 * ip * HIDDEN // 2,
+        GU_SBYTES=2 * ip * GU_SGROUPS,
+        DN_BYTES=HIDDEN * ip // 2,
+        DN_SGROUPS=dn_sg,
+        DN_SBYTES=HIDDEN * dn_sg,
+        VOCAB=sh.split(VOCAB, "vocab"),
+        NGRAM_ROWS=sh.split(NGRAM_ROWS, "n-gram table rows"),
+    )

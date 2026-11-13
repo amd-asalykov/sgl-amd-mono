@@ -24,29 +24,27 @@ def pack_bf16(w: torch.Tensor) -> torch.Tensor:
     return w16.permute(0, 2, 3, 4, 1, 5).contiguous().view(-1)
 
 
-def check_moe_params(m):
-    """Shape / dtype / layout asserts on the (sglang) MXFP4 MoE params the kernel reads."""
-    E = N_EXPERTS + 1
+def check_moe_params(m, tp: int = 1):
+    """Shape / dtype / layout asserts on the (sglang) MXFP4 MoE params the kernel reads
+    (at TP ``tp``: the rank's intermediate chunk of every expert, AITER-padded)."""
+    g = LY.geom(tp)
+    E, IP = N_EXPERTS + 1, g.MOE_INTER_PAD
     assert m["gu"].dtype == torch.uint8 and tuple(m["gu"].shape) == (
         E,
-        2 * LY.MOE_INTER_PAD,
+        2 * IP,
         HIDDEN // 2,
     ), m["gu"].shape
     assert m["dn"].dtype == torch.uint8 and tuple(m["dn"].shape) == (
         E,
         HIDDEN,
-        LY.MOE_INTER_PAD // 2,
+        IP // 2,
     ), m["dn"].shape
-    assert tuple(m["gu_s"].shape) == (E, 2 * LY.MOE_INTER_PAD, LY.GU_SGROUPS), m[
-        "gu_s"
-    ].shape
-    assert tuple(m["dn_s"].shape) == (E, HIDDEN, LY.DN_SGROUPS), m["dn_s"].shape
+    assert tuple(m["gu_s"].shape) == (E, 2 * IP, LY.GU_SGROUPS), m["gu_s"].shape
+    assert tuple(m["dn_s"].shape) == (E, HIDDEN, g.DN_SGROUPS), m["dn_s"].shape
     for k in ("gu", "dn", "gu_s", "dn_s"):
         assert m[k].is_contiguous() and m[k].element_size() == 1, k
-    assert m["gu"].numel() == E * LY.GU_BYTES and m["dn"].numel() == E * LY.DN_BYTES
-    assert (
-        m["gu_s"].numel() == E * LY.GU_SBYTES and m["dn_s"].numel() == E * LY.DN_SBYTES
-    )
+    assert m["gu"].numel() == E * g.GU_BYTES and m["dn"].numel() == E * g.DN_BYTES
+    assert m["gu_s"].numel() == E * g.GU_SBYTES and m["dn_s"].numel() == E * g.DN_SBYTES
 
 
 def pack_hc_down(w_down, w_inj=None):
@@ -164,11 +162,12 @@ def _common_rows(row, t):
     row[LY.P_DN_S] = t["moe"]["dn_s"].data_ptr()
 
 
-def qsa_ptr_row(t, k_buf, v_buf, ring, comp):
+def qsa_ptr_row(t, k_buf, v_buf, ring, comp, tp: int = 1):
     """Pointer table row of a QSA layer (and its KV / index-ring / compressed
-    buffers)."""
+    buffers; at TP the rank's KV heads)."""
+    kv = LY.geom(tp).KV
     for b in (k_buf, v_buf):  # addressed with 64-bit pointers (any pool size)
-        assert b.is_contiguous() and b.shape[-2:] == (2, 256)
+        assert b.is_contiguous() and b.shape[-2:] == (kv, 256)
     for b in (ring, comp):
         assert b.is_contiguous() and b.numel() * b.element_size() < 2**32, (
             "buffer offsets are 32-bit"
@@ -287,10 +286,10 @@ def pack_mtp(lw, moe, proj):
     }
 
 
-def mtp_rows(m, k_buf, v_buf, ring, comp, grow):
+def mtp_rows(m, k_buf, v_buf, ring, comp, grow, tp: int = 1):
     """Pointer rows of a draft launch: [QSA layer row, global row (+ fusion
     pointers), final-mixer row]."""
-    row = qsa_ptr_row(m["layer"], k_buf, v_buf, ring, comp)
+    row = qsa_ptr_row(m["layer"], k_buf, v_buf, ring, comp, tp)
     grow[LY.G_MTP_PE] = m["pe"].data_ptr()
     grow[LY.G_MTP_PH] = m["ph"].data_ptr()
     grow[LY.G_MTP_FCE] = m["fce"].data_ptr()
@@ -315,11 +314,13 @@ def unshuffle16(w):
     )
 
 
-def unshuffle_moe_expert(m, e):
+def unshuffle_moe_expert(m, e, tp: int = 1):
     """Expert e of the AITER-layout MoE params back to the checkpoint layout, real
-    rows / K only: -> (gate [640, 1280], up [640, 1280], down [2560, 320],
-    gate_s [640, 80], up_s [640, 80], down_s [2560, 20])."""
-    I, IP = LY.MOE_INTER, LY.MOE_INTER_PAD
+    rows / K only: -> (gate [I, 1280], up [I, 1280], down [2560, I / 2],
+    gate_s [I, 80], up_s [I, 80], down_s [2560, I / 32]), I = 640 / tp (the rank's
+    chunk at TP)."""
+    g = LY.geom(tp)
+    I, IP = g.MOE_INTER, g.MOE_INTER_PAD
 
     def s_un(s):
         # e8m0_shuffle inverse: [a, d, f, c, e, b] -> [32 a + 16 b + c, 8 d + 4 e + f]
