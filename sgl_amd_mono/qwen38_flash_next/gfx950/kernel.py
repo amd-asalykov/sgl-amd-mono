@@ -1292,7 +1292,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 for s_ in range(LY.MIX_KSPLIT)
                             ]
                             + extra,
-                            32 if NT <= 8 else 16,
+                            32 if NT < 8 or (NT == 8 and TPW == 1) else 16,
                         )
                         if const_expr(src[0] == "mb" and i0 == 0):
                             for p_ in range_constexpr(NOP):
