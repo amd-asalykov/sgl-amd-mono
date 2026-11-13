@@ -270,7 +270,7 @@ of a step grows with it. Batches above 8 requests run SGLang's forward.
 - Model: Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8
 - conc <= 8
 - NEXTN with topk = 1, 3 draft steps, 4 draft tokens
-- TP 1 or 2 (TP 4: not yet); at TP 2 the MTP draft runs SGLang's forward until its launch is validated there
+- TP 1 or 2 (TP 4: not yet)
 - bf16 KV cache; `triton` or `aiter` attention backend
 - contexts up to 294,848 tokens
 - with SGLang's 4-slot index-key ring, a verify row past the pending group overwrites one of its members, and a

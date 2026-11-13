@@ -40,7 +40,10 @@ halves the bytes each draft step's lm_head reads (1.27 GB in bf16) and only the
 acceptance sees it; the target verifies with the bf16 lm_head. SGLang hands the
 draft the target's lm_head after the build (``set_lm_head_from_target``), so the
 spec wraps that and requantizes when the weight changes (+0.64 GB).
-``SGLANG_AMD_MONO_QWEN38_DRAFT_HEAD_FP8=0`` keeps the bf16 lm_head.
+``SGLANG_AMD_MONO_QWEN38_DRAFT_HEAD_FP8=0`` keeps the bf16 lm_head. At TP > 1 the
+lm_head is the rank's vocab shard: the copy quantizes the shard and returns bf16
+logits of it, which SGLang's logits processor all-gathers as it does the bf16
+head's (its symmetric-memory gatherer takes bf16 only).
 """
 
 from __future__ import annotations
@@ -138,9 +141,11 @@ SGLANG_READS = {
     "srt/distributed/parallel_state.py": ("cpu_group",),
 }
 
-# the TP sizes the draft launch serves: TP > 1 drafts run SGLang's MTP forward until
-# the draft launch is validated there (TP_PLAN commit 8)
-TP_SIZES = (1,)
+# the TP sizes the draft launch serves: the target's. At TP > 1 the launch runs the
+# rank's shard of the MTP layer (QSA q heads and KV head, MoE intermediate) with the
+# all-reduces and the vocab-sharded embedding exchange inside the kernel; the
+# logits are all-gathered by SGLang's logits processor, as for its own draft
+TP_SIZES = target.TP_SIZES
 
 # The draft runs on its own QSA backends whatever --speculative-draft-attention-backend
 # says (speculative/draft_utils.py stamps them "qsa"); the launch writes their caches.
@@ -217,8 +222,11 @@ class _DraftHead:
     docstring). It writes fp32 logits, into the step's logits buffer when the
     shapes match (the processor then returns them as they are)."""
 
-    def __init__(self, lm):
+    def __init__(self, lm, tp: int = 1):
         self.lm = lm
+        # TP > 1: the lm_head is the rank's vocab shard; the projection returns bf16
+        # logits of the shard for SGLang's all-gather (see the module docstring)
+        self.tp = int(tp)
         self.quant_method = _Fp8HeadMethod()
         self.weight = self.scale = None
         self.source = None
@@ -278,6 +286,12 @@ class _DraftHead:
         from sgl_amd_mono.qwen38_flash_next.gfx950 import draft_head
 
         out, self.out = self.out, None
+        if self.tp > 1:
+            # the shard's logits, gathered by the logits processor (bf16, as the bf16
+            # head's are, so its symmetric-memory all-gather takes them)
+            return draft_head.gemv(
+                x.to(torch.bfloat16), self.weight, self.scale, torch.bfloat16
+            )
         n = self.weight.shape[0]
         if (
             out is None
@@ -299,7 +313,7 @@ class _Draft:
         self.seen: set = set()
         self.backend_checked: set = set()
         on = os.environ.get(DRAFT_HEAD_FP8_ENV, "1") == "1"
-        self.head = _DraftHead(lm) if on else None
+        self.head = _DraftHead(lm, getattr(runner, "tp", 1)) if on else None
         self.routes: dict = {}  # TP > 1: each draft step key's agreed verdict
 
     def lockstep(self, key, ok: bool) -> bool:

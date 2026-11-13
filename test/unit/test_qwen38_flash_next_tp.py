@@ -431,15 +431,15 @@ def test_parity_alternates_at_odd_launch_counts(n_launches):
             LY.check_parity_launches(n_launches, 2)
 
 
-def test_draft_refuses_tp2_until_validated():
+def test_the_draft_serves_the_target_tp_sizes():
+    # TP_PLAN commit 8: the MTP draft launch runs at TP 2 (the runner refuses nothing)
+    from sgl_amd_mono.qwen38_flash_next import draft as D
+    from sgl_amd_mono.qwen38_flash_next import spec as q38
     from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
 
-    d = object.__new__(R.DraftRunner)
-    d.tp = 1
-    d.refuse_tp_launch()
-    d.tp = 2  # the MTP draft is not validated at TP 2 (TP_PLAN commit 8)
-    with pytest.raises(NotImplementedError):
-        d.refuse_tp_launch()
+    assert D.TP_SIZES == q38.TP_SIZES == (1, 2)
+    assert D.SPEC.devices["gfx950"].tp_sizes == (1, 2)
+    assert not hasattr(R.DraftRunner, "refuse_tp_launch") or R.DraftRunner.refuse_tp_launch is R._Base.refuse_tp_launch
 
 
 # ---------------------------------------------------------------- host plumbing

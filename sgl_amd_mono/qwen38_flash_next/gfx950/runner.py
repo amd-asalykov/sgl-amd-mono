@@ -834,15 +834,6 @@ class DraftRunner(_Base):
         self.compile_in_lockstep((R, S), [build])
         return self._keep(key, (self._upload(rows), build))
 
-    def refuse_tp_launch(self) -> None:
-        """The MTP draft has not run at TP > 1 yet (TP_PLAN commit 8): every TP > 1
-        draft launch is refused until it is validated."""
-        if self.tp > 1:
-            raise NotImplementedError(
-                f"Qwen3.8-Flash-Next monokernel: TP {self.tp} draft launches are not "
-                "validated yet (TP_PLAN commit 8)"
-            )
-
     def launch(self, fb, hidden_states: torch.Tensor):
         """A draft step -> (the draft mixer's output x [S, HIDDEN], the
         hyper-connection hidden states [S, HC_DIM])."""
