@@ -162,9 +162,10 @@ def _common_rows(row, t):
     row[LY.P_DN_S] = t["moe"]["dn_s"].data_ptr()
 
 
-def qsa_ptr_row(t, k_buf, v_buf, ring, comp, tp: int = 1):
+def qsa_ptr_row(t, k_buf, v_buf, ring, comp, tp: int = 1, rp_store: bool = True):
     """Pointer table row of a QSA layer (and its KV / index-ring / compressed
-    buffers; at TP the rank's KV heads)."""
+    buffers; at TP the rank's KV heads); ``rp_store``: the layer stores the
+    step's RoPE positions (``layout.P_RP_STORE``)."""
     kv = LY.geom(tp).KV
     for b in (k_buf, v_buf):  # addressed with 64-bit pointers (any pool size)
         assert b.is_contiguous() and b.shape[-2:] == (kv, 256)
@@ -188,6 +189,7 @@ def qsa_ptr_row(t, k_buf, v_buf, ring, comp, tp: int = 1):
     row[LY.P_VBUF] = v_buf.data_ptr()
     row[LY.P_RING] = ring.data_ptr()
     row[LY.P_COMP] = comp.data_ptr()
+    row[LY.P_RP_STORE] = int(rp_store)
     return row
 
 

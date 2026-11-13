@@ -3934,6 +3934,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         rtt_row = rtt_row_of(r)
                         r_ring = _rsrc(ptr(layer, LY.P_RING))
                         r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
+                        # ring <= L + 2: a batch token's rope-position store can land in the start slot of a group
+                        # completing in the batch, which a later QSA layer of the step reads (one buffer for all
+                        # layers): only the step's last QSA layer stores them, every layer reads the pre-step ones
+                        rp_flag = ptr(layer, LY.P_RP_STORE) if const_expr(ring <= L + 2) else None
                         gfirst = pos0 // 4  # first group that can complete in these tokens
                         # Everything of the group compression except the batch payload is addressed by positions known at
                         # stage start: the older ring members, the group's rope position, its (cos, sin), its
@@ -4055,7 +4059,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     r_ring,
                                     (req * ring + pos % ring) * 128 + tid,
                                 )
-                            if tid < 3:
+                            rp_on = tid < 3
+                            if const_expr(rp_flag is not None):
+                                rp_on = rp_on & (rp_flag != fx.Int64(0))
+                            if rp_on:
                                 bo.buffer_store(
                                     fx.Vector.from_elements(
                                         [
