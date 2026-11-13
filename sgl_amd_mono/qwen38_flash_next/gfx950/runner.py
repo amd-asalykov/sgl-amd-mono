@@ -233,12 +233,16 @@ class _Base:
         self._synced.add(R)
 
     def refuse_tp_launch(self) -> None:
-        """TP > 1 runs no launch yet: the stages are still the TP 1 ones (sharded
-        stages and the in-kernel all-reduce are TP_PLAN commits 4-5)."""
-        if self.tp > 1:
+        """TP 4 runs no launch yet (its stages: a 64-K out_proj unit, core_split 16,
+        6 q heads an attention task; TP_PLAN commit 9). TP 2 launches run the
+        sharded stages and the in-kernel all-reduces; SGLang still routes TP > 1
+        away (``spec.TP_SIZES``) until the prelude's vocab-shard exchange and check
+        mode exist (TP_PLAN commits 6-7): the prelude reads a full (replicated)
+        embedding and n-gram table."""
+        if self.tp > 2:
             raise NotImplementedError(
                 f"Qwen3.8-Flash-Next monokernel: TP {self.tp} launches are not "
-                "implemented yet (sharded stages, in-kernel all-reduce)"
+                "implemented yet (TP 4 stages)"
             )
 
     def set_deadline(self, seconds: float) -> None:

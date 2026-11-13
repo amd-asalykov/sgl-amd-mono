@@ -429,7 +429,10 @@ def test_compile_in_lockstep(monkeypatch, no_capture, tp, rank, first):
     assert sorted(built) == keys and built[0] == first and barriers == ["g"]
     r.compile_in_lockstep(2, keys)  # once a batch size
     assert len(built) == 5 and len(barriers) == 1
-    with pytest.raises(NotImplementedError):
+    if tp > 2:  # TP 2 launches run (TP_PLAN commits 4-5), TP 4 not yet
+        with pytest.raises(NotImplementedError):
+            r.refuse_tp_launch()
+    else:
         r.refuse_tp_launch()
 
 

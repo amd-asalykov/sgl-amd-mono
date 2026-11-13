@@ -59,6 +59,7 @@ from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_NT,
+    CM_SYS,
     bf2_f32,
     bf16_pair,
 )
@@ -237,6 +238,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     # every launch of a runner finds its regions and the guard's flags at the same
     # offsets
     PEER = LY.peer_layout(TPW, MAX_T)
+    # peer words carry tag * 8 + the layer's index in the launch: the layers of a
+    # launch share its tag and its regions A / F
+    assert n_layers <= 8
     G = BLOCKS
     NCT = (NT + 15) // 16  # MFMA column tiles of the S rows
     KPH = LY.kphases(NT)  # K phases of the K=2560 activation GEMMs
@@ -438,6 +442,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 bo.buffer_load(_rsrc(epoch), 0, vec_width=1, dtype=T.i32)
             )
             tag = step_value * LY.LAUNCH_SLOTS + launch_id + 1
+            if const_expr(TPW > 1):
+                # the peer buffer half of this launch (``layout.verify_parity``: a
+                # running launch count, 13 a verify step; a draft launch is launch 0)
+                ppar = (step_value * LY.LAUNCHES_PER_VERIFY + launch_id) & 1
 
             # ---- helpers
             def ptr(layer, slot):
@@ -486,10 +494,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 )
 
             def poll(specs, batch=POLL_MAX):
-                """specs = [(base_addr, pair index, npairs in {1, 2}[, ok[, cm]])] -> [[Int32 bits]]. Entries with a
-                false (per-lane) ok are not waited for: they read pair 0 of their mailbox and return 0 (ok None: always
-                waited for). cm: the entry's cache modifier (default CM_DEV, the device-scope mailboxes; a peer word
-                takes CM_SYS); one batch may mix them."""
+                """specs = [(base_addr, pair index, npairs in {1, 2}[, ok[, cm[, tag]]])] -> [[Int32 bits]]. Entries
+                with a false (per-lane) ok are not waited for: they read pair 0 of their mailbox and return 0 (ok None:
+                always waited for). cm: the entry's cache modifier (default CM_DEV, the device-scope mailboxes; a peer
+                word takes CM_SYS); one batch may mix them. tag: the entry's tag (default the launch's)."""
                 if const_expr(len(specs) == 0):
                     return []
                 if const_expr(len(specs) > batch):
@@ -517,13 +525,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
                 nw = sum(2 * sp[2] for sp in specs)
                 okw = []
+                tgw = []
                 for sp, ok in zip(specs, oks):
                     okw += [ok] * sp[2]
+                    tgw += [sp[5] if len(sp) > 5 else None] * sp[2]
 
                 def pending(v):
                     bad = None
                     for q in range_constexpr(nw // 2):
-                        bq = v[2 * q + 1] != tag
+                        bq = v[2 * q + 1] != (tag if tgw[q] is None else tgw[q])
                         if const_expr(okw[q] is not None):
                             bq = bq & okw[q]
                         bad = bq if bad is None else (bad | bq)
@@ -1306,6 +1316,74 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                     gpu.barrier()
 
+            # ---- TP all-reduce of a row-parallel partial (GDN out_proj / QSA o_proj: region A; MoE down: F), fused
+            # into the combine: the CTA of row group rg pushes its bf16-rounded [S][16] tile to slice ``rank`` of
+            # every rank's region (its own too), then each combine thread polls the W slices of its own buffer and
+            # sums them in f32 in rank order, rounded to bf16 (SGLang's RowParallel bf16 output + custom
+            # all-reduce): every rank gets the same bits, so the replicated stages after it agree. One region a
+            # kind: a launch's layers reuse it (the next layer's push of a tile needs every rank's mix of this
+            # one, which needs every rank's combine reads of this one), told apart by the layer in the word tag.
+            def peer_tag(layer):
+                return tag * 8 + layer
+
+            def peer_region(region):
+                return fx.Int64(PEER[region]) + fx.Int64(ppar) * fx.Int64(PEER["_parity"])
+
+            def peer_push(region, layer, rg, block_val):
+                """Waves w < W: tile rg's partial (block_val(p, t) -> f32 columns 2 p, 2 p + 1 of row t) to rank w's
+                region, slice ``rank``: whole 16-byte stores of 2 tagged pairs, a tile's S rows contiguous."""
+                if wave < TPW:
+                    dst = load_ptr64(peers, fx.min(wave, TPW - 1)) + peer_region(region)
+                    ptag = peer_tag(layer)
+                    tile0 = (rank * LY.OUT_RG + rg) * (MAX_T * LY.PEER_PAIRS_A_TILE)
+                    NQ2 = 4 * NT  # 16-byte stores of a tile
+                    for i0 in range_constexpr(0, NQ2, 64):
+                        q2 = lane + i0
+                        if q2 < NQ2:
+                            t = q2 // 4
+                            p = (q2 % 4) * 2
+                            a0, a1 = block_val(p, t)
+                            b0, b1 = block_val(p + 1, t)
+                            bo.buffer_store(
+                                fx.Vector.from_elements(
+                                    [
+                                        bf16_pair(a0, a1).bitcast(fx.Int32),
+                                        ptag,
+                                        bf16_pair(b0, b1).bitcast(fx.Int32),
+                                        ptag,
+                                    ],
+                                    fx.Int32,
+                                ),
+                                _rsrc(dst),
+                                (tile0 + q2 * 2) * 2,
+                                cache_modifier=CM_SYS,
+                            )
+
+            def peer_specs(region, layer, rg, t, p):
+                """Poll specs of the W slices of pair p (columns 16 rg + 2 p, + 1) of row t in this rank's buffer."""
+                own = sym + peer_region(region)
+                ptag = peer_tag(layer)
+                return [
+                    (
+                        own,
+                        ((src * LY.OUT_RG + rg) * MAX_T + t) * LY.PEER_PAIRS_A_TILE + p,
+                        1,
+                        None,
+                        CM_SYS,
+                        ptag,
+                    )
+                    for src in range(TPW)
+                ]
+
+            def peer_sum(got):
+                """bf16(sum over ranks 0..W-1 in order of the f32 of their bf16 pairs) -> (v0, v1)."""
+                v0, v1 = bf2_f32(got[0][0])
+                for src in range_constexpr(1, TPW):
+                    lo, hi = bf2_f32(got[src][0])
+                    v0 = v0 + lo
+                    v1 = v1 + hi
+                return bf_round(v0), bf_round(v1)
+
             def combine_specs(layer, hc, src, rg, i, ok=None):
                 """Poll specs of combine item i: [residual word (mailbox src)] + the MIX_KSPLIT combine-gate partials."""
                 q = tid + i * THREADS
@@ -1336,14 +1414,26 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 return combine_specs(layer, hc, src, rg, 0, tid < NQ)
 
             def combine_rows(
-                layer, hc, src, rg, block_val, dst, dst_ssq, out_global=False, pre=None
+                layer,
+                hc,
+                src,
+                rg,
+                block_val,
+                dst,
+                dst_ssq,
+                out_global=False,
+                pre=None,
+                peer=None,
             ):
                 """dst[t, b*HIDDEN + 16 rg + r] = H + block_out[t, 16 rg + r] * gate[t, b], the combine gate
                 2 sigmoid(Hn[t] . Winj_b / HC) from the mix's per-slice partials (tid < 32 T); plus the per-(t, b)
                 sum-of-squares partial rg of the new stream. block_val(p, t) -> (v0, v1). pre: the polled
-                combine_pre(...) values (else polled here). TP > 1: block_val is this rank's partial (its all-reduce is
-                TP_PLAN commit 5; the runners do not launch TP > 1 yet)."""
+                combine_pre(...) values (else polled here). peer (TP > 1): block_val is this rank's partial, all-reduced
+                through peer region ``peer`` (its W slices lead the combine's poll batch)."""
                 NQ = 32 * NT
+                TPR = TPW > 1 and peer is not None
+                if const_expr(TPR):
+                    peer_push(peer, layer, rg, block_val)
                 for i in range_constexpr((NQ + THREADS - 1) // THREADS):
                     q = tid + i * THREADS
                     if q < NQ:
@@ -1351,12 +1441,21 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         b = (q % 32) // 8
                         p = q % 8
                         row = b * HIDDEN + rg * 16 + p * 2
-                        # one batched poll: residual word + combine-gate partials
-                        got = (
-                            pre
-                            if const_expr(pre is not None)
-                            else poll(combine_specs(layer, hc, src, rg, i))
-                        )
+                        # one batched poll: [peer slices +] residual word + combine-gate partials
+                        if const_expr(TPR):
+                            psp = peer_specs(peer, layer, rg, t, p)
+                            if const_expr(pre is not None):
+                                pgot = poll(psp)
+                                got = pre
+                            else:
+                                allg = poll(psp + combine_specs(layer, hc, src, rg, i))
+                                pgot, got = allg[:TPW], allg[TPW:]
+                        else:
+                            got = (
+                                pre
+                                if const_expr(pre is not None)
+                                else poll(combine_specs(layer, hc, src, rg, i))
+                            )
                         if const_expr(src[0] == "mb"):
                             hw = got[0][0]
                             gp = got[1:]
@@ -1368,7 +1467,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             gsum = gsum + gp[s_][0].bitcast(fx.Float32)
                         gt = fx.Float32(2.0) * sigmoid(gsum * (1.0 / HC))
                         h0, h1 = bf2_f32(hw)
-                        v0, v1 = block_val(p, t)
+                        if const_expr(TPR):
+                            v0, v1 = peer_sum(pgot)
+                        else:
+                            v0, v1 = block_val(p, t)
                         o0 = bf_round(h0 + v0 * gt)
                         o1 = bf_round(h1 + v1 * gt)
                         put_bf(dst, t * (HC_DIM // 2) + row // 2, o0, o1)
@@ -2562,6 +2664,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         mb(layer, "h1"),
                         mb(layer, "h1ssq"),
                         pre=cgot,
+                        peer="A",
                     )
                     gpu.barrier()
 
@@ -3150,6 +3253,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         mb(layer, "h2ssq"),
                         out_global,
                         pre=cgot,
+                        peer="F",
                     )
                     gpu.barrier()
 
