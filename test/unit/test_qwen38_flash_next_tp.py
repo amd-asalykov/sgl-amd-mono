@@ -285,3 +285,61 @@ def test_unshuffle_moe_expert_at_tp(tp):
         got = packing.unshuffle_moe_expert(m, e, tp)
         for x, r in zip(got, (gate[e], up[e], down[e], gate_s[e], up_s[e], down_s[e])):
             assert torch.equal(x, r)
+
+
+# ---------------------------------------------------------------- the peer buffer
+@pytest.mark.parametrize("tp", [1, 2, 4])
+@pytest.mark.parametrize("S", [4, 8, 32])
+def test_peer_layout(tp, S):
+    from sgl_amd_mono.common.guard import FLAG_BYTES
+
+    pl = LY.peer_layout(tp, S)
+    part, src = pl["_parity"], pl["_src"]
+    assert src == S * HIDDEN * 4  # [rg 160][S][8 tagged pairs]
+    assert part >= tp * src and part % LY.PEER_ALIGN == 0
+    bases = [pl[n] for n in LY.PEER_REGIONS]
+    assert bases == sorted(bases) and len(set(bases)) == 3
+    for b, nxt in zip(bases, bases[1:] + [pl["flags"]]):
+        assert b % LY.PEER_ALIGN == 0 and nxt - b == 2 * part  # two parity halves
+    assert pl["_bytes"] == pl["flags"] + FLAG_BYTES
+    # every (src, rg, row, pair) word is its own, inside one region-parity
+    seen = set()
+    for s_ in range(tp):
+        for rg in (0, 1, LY.OUT_RG - 1):
+            for t in range(S):
+                for p in range(8):
+                    i = LY.peer_pair(s_, rg, t, p, S)
+                    assert 0 <= i * 8 < tp * src and i not in seen
+                    seen.add(i)
+    # a tile's S rows are one contiguous run: whole 128 B lines for even S
+    run0 = LY.peer_pair(0, 5, 0, 0, S) * 8
+    assert LY.peer_pair(0, 5, S - 1, 7, S) * 8 + 8 - run0 == S * 64
+    if S % 2 == 0:
+        assert run0 % 128 == 0 and (S * 64) % 128 == 0
+
+
+def test_peer_layout_size():
+    # TP 4 at 32 rows: about 7.9 MB (TP_PLAN commit 2)
+    assert 7.8e6 < LY.peer_layout(4, 32)["_bytes"] < 8.0e6
+    with pytest.raises(ValueError):
+        LY.peer_layout(3, 32)
+    with pytest.raises(ValueError):
+        LY.peer_layout(2, 33)
+
+
+def test_launch_parity_alternates():
+    # consecutive launches always use the other half, across step boundaries too
+    seq = [LY.verify_parity(s, i) for s in range(4) for i in range(LY.LAUNCHES_PER_VERIFY)]
+    assert all(a != b for a, b in zip(seq, seq[1:]))
+    # the tag's parity would not: launch 12 and the next step's launch 0 share it
+    tag = [(s * LY.LAUNCH_SLOTS + i + 1) & 1 for s in range(2) for i in range(13)]
+    assert tag[12] == tag[13]
+    d = [LY.draft_parity(s) for s in range(6)]
+    assert all(a != b for a, b in zip(d, d[1:]))
+
+
+def test_launches_per_verify_is_the_plan():
+    from sgl_amd_mono.qwen38_flash_next.gfx950.runner import launch_plans
+
+    kinds = ["qsa" if i % 4 == 3 else "gdn" for i in range(48)]
+    assert len(launch_plans(kinds)) == LY.LAUNCHES_PER_VERIFY

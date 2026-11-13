@@ -474,3 +474,59 @@ def geom(tp: int = 1) -> Geom:
         VOCAB=sh.split(VOCAB, "vocab"),
         NGRAM_ROWS=sh.split(NGRAM_ROWS, "n-gram table rows"),
     )
+
+
+# ---- the symmetric peer buffer at TP > 1 (``notes/TP_PLAN.md`` decision 3, commit 2)
+PEER_REGIONS = ("A", "F", "X")  # attention AR (out_proj / o_proj), MoE AR (down), prelude
+PEER_ALIGN = 4096
+PEER_PAIRS_A_TILE = 8  # bf16 pairs a (row group, row) tile line: 16 columns
+LAUNCHES_PER_VERIFY = 13  # odd: the running launch parity alternates across steps
+
+
+def peer_layout(tp: int, S: int) -> dict:
+    """Byte offsets of the symmetric peer buffer of a runner of at most ``S`` rows at
+    TP ``tp``: one region per exchange kind of a launch, so no two exchanges of one
+    launch (they carry the same tag) share a word, each in two parity halves (a fast
+    rank's next launch writes the other half while a slow rank still reads this
+    one), then the guard's error flags.
+
+    A region-parity is [src rank W][row group 160][row S][8 tagged bf16 pairs]:
+    rank ``src`` pushes its 16-column partial of row group ``rg`` into slice ``src``
+    of every rank's buffer (its own too), tile-major, so the S rows of one tile are
+    S whole 64 B pair runs (a wave's push fills whole 128 B lines); every rank sums
+    the W slices of its own buffer in rank order. Region X carries a row's owner
+    push (the vocab-sharded embedding and n-gram rows), laid out alike.
+
+    -> {"A", "F", "X": region base, "_parity": parity stride, "_src": source slice
+    stride, "flags", "_bytes"}."""
+    from sgl_amd_mono.common.guard import FLAG_BYTES, FLAG_WORDS
+
+    if tp not in TP_SIZES or not 1 <= S <= 32:
+        raise ValueError(f"peer layout of TP {tp}, {S} rows")
+    assert tp <= FLAG_WORDS
+    src = OUT_RG * S * PEER_PAIRS_A_TILE * 8  # = S * HIDDEN * 4 bytes
+    part = padded(tp * src, PEER_ALIGN)
+    out, off = {}, 0
+    for name in PEER_REGIONS:
+        out[name] = off
+        off += 2 * part
+    out.update({"_parity": part, "_src": src, "flags": off, "_bytes": off + FLAG_BYTES})
+    return out
+
+
+def peer_pair(src: int, rg: int, t: int, p: int, S: int) -> int:
+    """Pair index (8 B units) of bf16 pair ``p`` (columns 16 rg + 2 p, + 1) of row ``t``
+    pushed by rank ``src``, inside a region-parity of ``peer_layout``."""
+    return ((src * OUT_RG + rg) * S + t) * PEER_PAIRS_A_TILE + p
+
+
+def verify_parity(step: int, launch_id: int) -> int:
+    """The peer-buffer half of a verify launch: a running launch count (13 launches
+    a step, odd, so it alternates across steps too; the tag's parity does not:
+    launch 12 and the next step's launch 0 share it)."""
+    return (step * LAUNCHES_PER_VERIFY + launch_id) & 1
+
+
+def draft_parity(step: int) -> int:
+    """The peer-buffer half of a draft launch (one launch a step)."""
+    return step & 1

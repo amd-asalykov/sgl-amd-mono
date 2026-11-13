@@ -232,6 +232,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     assert 1 <= R <= MAX_R and 1 <= NT <= MAX_T
     n_layers = len(plan)
     regions, _ = scratch_layout(n_layers + 2, NT, R, TPW)
+    # the symmetric peer buffer (TP > 1): laid out for MAX_T rows whatever NT, so
+    # every launch of a runner finds its regions and the guard's flags at the same
+    # offsets
+    PEER = LY.peer_layout(TPW, MAX_T)
     G = BLOCKS
     NCT = (NT + 15) // 16  # MFMA column tiles of the S rows
     KPH = LY.kphases(NT)  # K phases of the K=2560 activation GEMMs
@@ -387,12 +391,26 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
         scratch: Int64,
         epoch: Int64,
         launch_id: Int32,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
     ):
         _ = keyed
-        # every wait of this launch runs under the guard (deadline, error words);
-        # TP 1: no peers, a failure stops this GPU's launch
+        # every wait of this launch runs under the guard (deadline, error words).
+        # TP 1: no peers (sym / peers / rank are 0 and unread), a failure stops this
+        # GPU's launch; TP > 1: a failure also raises this rank's flag in every
+        # peer's buffer, and a wait stops once a peer's flag is up
         with guard.scope(
-            guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
+            guard.Guard(
+                epoch,
+                own=sym if TPW > 1 else None,
+                peers=peers if TPW > 1 else None,
+                rank=rank if TPW > 1 else None,
+                npes=TPW,
+                flags_offset=PEER["flags"] if TPW > 1 else 0,
+                fault_site=fault_site or None,
+                fault_after=fault_after,
+            )
         ):
             tid = fx.thread_idx.x
             bid = fx.block_idx.x
@@ -460,17 +478,20 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 )
 
             def poll(specs, batch=POLL_MAX):
-                """specs = [(base_addr, pair index, npairs in {1, 2}[, ok])] -> [[Int32 bits]]. Entries with a false
-                (per-lane) ok are not waited for: they read pair 0 of their mailbox and return 0."""
+                """specs = [(base_addr, pair index, npairs in {1, 2}[, ok[, cm]])] -> [[Int32 bits]]. Entries with a
+                false (per-lane) ok are not waited for: they read pair 0 of their mailbox and return 0 (ok None: always
+                waited for). cm: the entry's cache modifier (default CM_DEV, the device-scope mailboxes; a peer word
+                takes CM_SYS); one batch may mix them."""
                 if const_expr(len(specs) == 0):
                     return []
                 if const_expr(len(specs) > batch):
                     return poll(specs[:batch], batch) + poll(specs[batch:], batch)
                 oks = [sp[3] if len(sp) > 3 else None for sp in specs]
+                cms = [sp[4] if len(sp) > 4 else CM_DEV for sp in specs]
 
                 def load_all():
                     words = []
-                    for sp, ok in zip(specs, oks):
+                    for sp, ok, cm in zip(specs, oks, cms):
                         b, i, n = sp[0], sp[1], sp[2]
                         if const_expr(ok is not None):
                             i = ok.select(fx.Int32(i), fx.Int32(0))
@@ -480,7 +501,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 fx.Int32(i) * 2,
                                 vec_width=2 * n,
                                 dtype=T.i32,
-                                cache_modifier=CM_DEV,
+                                cache_modifier=cm,
                             )
                         )
                         words += [w[e] for e in range(2 * n)]
@@ -5114,11 +5135,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
         scratch: Int64,
         epoch: Int64,
         launch_id: Int32,
+        sym: Int64,
+        peers: Int64,
+        rank: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         _ = keyed
-        qwen38_flash_next_kernel(h_in, h_out, ptab, scratch, epoch, launch_id).launch(
-            grid=(G,), block=(THREADS,), stream=stream
-        )
+        qwen38_flash_next_kernel(
+            h_in, h_out, ptab, scratch, epoch, launch_id, sym, peers, rank
+        ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     return launch

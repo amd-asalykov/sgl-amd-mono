@@ -173,6 +173,12 @@ class _Base:
         self._scratch_buf = PeerBuffer(nbytes, None, 0, 1, self.device)
         return self._scratch_buf.bytes.view(torch.int32)
 
+    def peer_args(self) -> tuple:
+        """The launch's (sym, peers, rank) arguments: this rank's peer buffer base,
+        the device table of every rank's base, and the rank; zeros at TP 1 (the
+        kernel reads none of them)."""
+        return (0, 0, 0)
+
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
         ticks = guard.deadline_ticks(seconds)
@@ -602,6 +608,7 @@ class VerifyRunner(_Base):
                 self.scratch.data_ptr(),
                 self.epoch.data_ptr(),
                 i,
+                *self.peer_args(),
                 stream=stream,
             )
             h = out
@@ -735,6 +742,7 @@ class DraftRunner(_Base):
             self.scratch.data_ptr(),
             self.epoch.data_ptr(),
             0,
+            *self.peer_args(),
             stream=torch.cuda.current_stream(),
         )
         self.epoch[:1].add_(1)
