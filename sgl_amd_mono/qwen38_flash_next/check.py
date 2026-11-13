@@ -10,7 +10,14 @@ is logged as a violation.
 The 13 launches run the whole model, so the check covers the step, not a layer.
 Both forwards write the same cache rows (the draft tokens' KV, index keys and
 verify scratch) from the same committed state, and the launches write them last,
-so the step leaves the caches as an unchecked step would."""
+so the step leaves the caches as an unchecked step would.
+
+At TP > 1 every rank runs the check in lockstep: the reference is SGLang's TP
+forward (its collectives on every rank), every rank compares its own outputs (the
+logits are all-gathered, so the full vocab), rank 0 logs the step, and the
+launches' residual streams, which every rank computes, must be bitwise equal
+across the ranks. The weights check compares each rank's shards with the
+checkpoint's matching slices (notes/tp_sglang_sharding.md)."""
 
 from __future__ import annotations
 
@@ -91,8 +98,27 @@ def _metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
     }
 
 
-def compare(ref: dict, out, forward_batch) -> None:
+def _cross_rank_equal(t: torch.Tensor, group) -> bool:
+    """Whether ``t`` holds the same bits on every rank of the CPU group ``group``."""
+    import torch.distributed as dist
+
+    mine = t.detach().contiguous().view(torch.uint8).flatten().cpu()
+    got = [torch.empty_like(mine) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(got, mine, group=group)
+    return all(torch.equal(g, got[0]) for g in got)
+
+
+def compare(ref: dict, out, forward_batch, runner=None) -> None:
     from sgl_amd_mono.qwen38_flash_next.spec import NUMERICS
+
+    tp = getattr(runner, "tp", 1)
+    rank = getattr(runner, "rank", 0)
+    if tp > 1 and not _cross_rank_equal(out.hidden_states, runner.cpu_group):
+        logger.error(
+            "monokernel check violation: rank %d's residual streams differ from "
+            "another rank's (the replicated streams must be bitwise equal)",
+            rank,
+        )
 
     got = {"logits": out.next_token_logits, "hidden": out.hidden_states}
     values = {
@@ -102,20 +128,21 @@ def compare(ref: dict, out, forward_batch) -> None:
     }
     pos = forward_batch.positions
     pos = pos[0] if pos.dim() == 2 else pos
-    logger.info(
-        "monokernel check step (%d requests, positions %d..%d): %s",
-        int(forward_batch.batch_size),
-        pos.min().item(),
-        pos.max().item(),
-        " ".join(f"{k}={v:.6g}" for k, v in values.items()),
-    )
+    if rank == 0:
+        logger.info(
+            "monokernel check step (%d requests, positions %d..%d): %s",
+            int(forward_batch.batch_size),
+            pos.min().item(),
+            pos.max().item(),
+            " ".join(f"{k}={v:.6g}" for k, v in values.items()),
+        )
     for name, bound in NUMERICS.bounds.items():
         v = values.get(name)
         if v is None:
             continue
         ok = v >= bound if name.endswith(".cosine") else v <= bound
         if not ok:
-            logger.error("monokernel check violation: %s = %.6g, bound %g", name, v, bound)  # fmt: skip
+            logger.error("monokernel check violation: rank %d %s = %.6g, bound %g", rank, name, v, bound)  # fmt: skip
 
 
 # ---------------------------------------------------------------- weights
@@ -184,11 +211,64 @@ def _load(path: str, names: list[str], device) -> dict:
     return out
 
 
-def weights(model, kinds: list[str]) -> None:
+def _gdn_channels(tp: int, r: int, device) -> torch.Tensor:
+    """Rank r's [q_r | k_r | v_r] rows of the GDN [q | k | v] channels (in_proj_qkv,
+    conv1d), each sub-block split separately."""
+    from sgl_amd_mono.qwen38_flash_next.gfx950.config import GDN_KEY_DIM, GDN_VAL_DIM
+
+    kd, vd = GDN_KEY_DIM // tp, GDN_VAL_DIM // tp
+    a = lambda s, n: torch.arange(s, s + n, device=device)  # noqa: E731
+    return torch.cat([a(r * kd, kd), a(GDN_KEY_DIM + r * kd, kd), a(2 * GDN_KEY_DIM + r * vd, vd)])  # fmt: skip
+
+
+def _small_shard(name: str, t: torch.Tensor, tp: int, r: int) -> torch.Tensor:
+    """Rank r's slice of a checkpoint small tensor (replicated ones whole)."""
+    if tp == 1:
+        return t
+    if name.endswith("linear_attn.conv1d.weight"):
+        return t[_gdn_channels(tp, r, t.device)]
+    if name.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
+        n = t.shape[0] // tp
+        return t[r * n : (r + 1) * n]
+    return t
+
+
+def _proj_shard(kind: str, key: str, j: int, w, s, tp: int, r: int):
+    """Rank r's slice of source ``j`` of a projection (weight [N, K], scale [N]):
+    column-parallel sources by rows, the row-parallel output projection by K."""
+    if tp == 1 or key == "qp2":  # the QSA indexer is replicated
+        return w, s
+    if key == "out":
+        k = w.shape[1] // tp
+        return w[:, r * k : (r + 1) * k], s
+    n = w.shape[0] // tp
+    if kind == "gdn" and key == "ip" and j == 0:  # in_proj_qkv: [q_r | k_r | v_r]
+        idx = _gdn_channels(tp, r, w.device)
+        return w[idx], s[idx]
+    if kind == "qsa" and j > 0:  # k_proj / v_proj: KV head r * 2 // tp (TP 4: pairs)
+        h = r * 2 // tp
+        return w[h * 256 : (h + 1) * 256], s[h * 256 : (h + 1) * 256]
+    return w[r * n : (r + 1) * n], s[r * n : (r + 1) * n]
+
+
+def _expert_shard(want: list, tp: int, r: int) -> list:
+    """Rank r's intermediate chunk of an expert's (gate, up, down, gate_s, up_s,
+    down_s) checkpoint tensors: gate / up rows, down columns (2 FP4 a byte, 32 a
+    scale)."""
+    if tp == 1:
+        return want
+    g, u, d, gs, us, ds = want
+    i = g.shape[0] // tp
+    rows = lambda t: t[r * i : (r + 1) * i]  # noqa: E731
+    cols = lambda t, per: t[:, r * i // per : (r + 1) * i // per]  # noqa: E731
+    return [rows(g), rows(u), cols(d, 2), rows(gs), rows(us), cols(ds, 32)]
+
+
+def weights(model, kinds: list[str], tp: int = 1, rank: int = 0) -> None:
     """Check mode, at build: the tensors the launches read of layers 0, 1 and 3
     (SGLang's params, its AITER-shuffled experts and FP8 projections un-shuffled)
-    against the checkpoint's bytes. A layout SGLang changed would not fault, it
-    would produce plausible garbage."""
+    against the checkpoint's bytes (at TP > 1, the rank's slices of them). A layout
+    SGLang changed would not fault, it would produce plausible garbage."""
     from sgl_amd_mono.qwen38_flash_next.gfx950 import packing
     from sgl_amd_mono.qwen38_flash_next.gfx950 import weights as views
 
@@ -196,8 +276,8 @@ def weights(model, kinds: list[str]) -> None:
     for i, kind in CHECKED_LAYERS.items():
         assert kinds[i] == kind, (i, kinds[i])
         layer, p = layers[i], f"{PREFIX}layers.{i}."
-        small = views.checkpoint_dict(layer, kind, layer.ple is not None)
-        table = views.GDN_PROJ if kind == "gdn" else views.QSA_PROJ
+        small = views.checkpoint_dict(layer, kind, layer.ple is not None, tp)
+        table = views.gdn_proj(tp) if kind == "gdn" else views.qsa_proj(tp)
         proj = views.proj_params(layer, table)
         names = [p + k for k in small]
         names += [f"{p}{x}.{y}" for k in proj for x in PROJ_SOURCES[kind][k] for y in ("weight", "weight_scale")]  # fmt: skip
@@ -208,12 +288,27 @@ def weights(model, kinds: list[str]) -> None:
         bad = [
             k
             for k, t in small.items()
-            if not torch.equal(t.float().reshape(-1), ref[p + k].float().reshape(-1))
+            if not torch.equal(
+                t.float().reshape(-1),
+                _small_shard(k, ref[p + k], tp, rank).float().reshape(-1),
+            )
         ]
         for k, (w, sc) in proj.items():
             srcs = PROJ_SOURCES[kind][k]
-            ref_w = torch.cat([ref[f"{p}{x}.weight"] for x in srcs]).view(torch.uint8)
-            ref_s = torch.cat([ref[f"{p}{x}.weight_scale"].float().reshape(-1) for x in srcs])  # fmt: skip
+            parts = [
+                _proj_shard(
+                    kind,
+                    k,
+                    j,
+                    ref[f"{p}{x}.weight"].view(torch.uint8),
+                    ref[f"{p}{x}.weight_scale"].float().reshape(-1),
+                    tp,
+                    rank,
+                )
+                for j, x in enumerate(srcs)
+            ]
+            ref_w = torch.cat([a for a, _ in parts])
+            ref_s = torch.cat([b for _, b in parts])
             n = ref_w.shape[0]
             got = packing.unshuffle16(w)
             if not (
@@ -222,15 +317,16 @@ def weights(model, kinds: list[str]) -> None:
                 and not got[n:].any()
             ):
                 bad.append(k)
-        moe = views.moe_params(layer.mlp.experts)
+        moe = views.moe_params(layer.mlp.experts, tp)
         for e in CHECKED_EXPERTS:
             src = _expert_name(e)
-            got = packing.unshuffle_moe_expert(moe, e)
+            got = packing.unshuffle_moe_expert(moe, e, tp)
             want = [
                 ref[f"{p}{src}.{w}_proj.{y}"].view(torch.uint8)
                 for y in ("weight", "weight_scale")
                 for w in ("gate", "up", "down")
             ]
+            want = _expert_shard(want, tp, rank)
             bad += [f"expert {e} {n}" for n, g, r in zip(("gate", "up", "down", "gate_s", "up_s", "down_s"), got, want) if not torch.equal(g, r)]  # fmt: skip
         del ref, proj
         if bad:
@@ -242,9 +338,11 @@ def weights(model, kinds: list[str]) -> None:
             )
         else:
             logger.info(
-                "monokernel check weights layer %d: %d tensors, %d projections and "
-                "%d experts equal the checkpoint",
+                "monokernel check weights layer %d (TP %d rank %d): %d tensors, %d "
+                "projections and %d experts equal the checkpoint",
                 i,
+                tp,
+                rank,
                 len(small),
                 len(table),
                 len(CHECKED_EXPERTS),

@@ -7,6 +7,7 @@ requests on it), its build keys and its fallback forward. SGLang checks the
 declared requirements, the same way for every spec."""
 
 import inspect
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -479,7 +480,7 @@ def test_the_ple_layer_is_one_reason():
 def test_the_recipe_routes_verify_batches_of_one_to_eight():
     # NEXTN, 3 steps: 4 verify rows a request, the 4- to 32-row launches
     assert q38.SPEC.widths("gfx950") == tuple(range(4, 33, 4))
-    assert q38.SPEC.devices["gfx950"].tp_sizes == (1,)
+    assert q38.SPEC.devices["gfx950"].tp_sizes == (1, 2)
     assert covered_capture_sizes(
         widths=q38.SPEC.widths("gfx950"), tokens_per_request=4, sizes=[1, 2, 4, 8]
     ) == list(range(1, 9))
@@ -771,8 +772,13 @@ def _model(**changes):
     return lm
 
 
-def _model_reasons(lm, tp=1, context_len=262144):
-    parallel = SimpleNamespace(tp_size=tp, pp_size=1, attn_cp_size=1, moe_ep_size=1)
+def _model_reasons(lm, tp=1, context_len=262144, **par):
+    parallel = SimpleNamespace(
+        tp_size=tp, tp_rank=0, pp_size=1, attn_cp_size=1, moe_ep_size=1,
+        attn_tp_size=tp, moe_tp_size=tp, attn_dp_enabled=False,
+        enable_attn_tp_input_scattered=False,
+    )  # fmt: skip
+    vars(parallel).update(par)
     with (
         mock.patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
         mock.patch(
@@ -788,7 +794,7 @@ def test_the_model_is_accepted():
 
 
 def test_each_unsupported_model_is_one_reason():
-    assert len(_model_reasons(_model(), tp=2)) == 1
+    assert len(_model_reasons(_model(), tp=4)) == 1  # TP 4: not yet (TP_PLAN commit 9)
     assert len(_model_reasons(_model(), context_len=MAX_CTX)) == 1
     assert len(_model_reasons(_model(capture_aux_hidden_states=True))) == 1
     lm = _model()
@@ -797,6 +803,30 @@ def test_each_unsupported_model_is_one_reason():
     lm = _model()
     lm.model.end_layer = 24  # pipeline stage
     assert len(_model_reasons(lm)) == 1
+
+
+def test_tp2_needs_the_tp_groups_and_the_rank_shards():
+    # the TP 1 model's (full) params are not a TP 2 rank's shards
+    assert _model_reasons(_model(), tp=2)
+    p = SimpleNamespace(attn_tp_size=2, moe_tp_size=2, attn_dp_enabled=False,
+                        enable_attn_tp_input_scattered=False)  # fmt: skip
+    assert q38._tp_reasons(p, 1) == [] and q38._tp_reasons(p, 2) == []
+    for k, v in (("attn_tp_size", 1), ("moe_tp_size", 1), ("attn_dp_enabled", True),
+                 ("enable_attn_tp_input_scattered", True)):  # fmt: skip
+        assert len(q38._tp_reasons(SimpleNamespace(**(vars(p) | {k: v})), 2)) == 1
+    with mock.patch.dict(os.environ, {"SGLANG_AITER_K3_OPT": "1"}):
+        assert len(q38._tp_reasons(p, 2)) == 1
+    # the embedding: rank r's vocab shard
+    for rank in (0, 1):
+        emb = SimpleNamespace(
+            weight=torch.empty(124160, 2560, device="meta"),
+            shard_indices=SimpleNamespace(org_vocab_start_index=rank * 124160),
+        )
+        assert q38._embed_shard_reasons(emb, 2, rank) == []
+        assert len(q38._embed_shard_reasons(emb, 2, 1 - rank)) == 1
+    full = SimpleNamespace(weight=torch.empty(248320, 2560, device="meta"),
+                           shard_indices=SimpleNamespace(org_vocab_start_index=0))  # fmt: skip
+    assert len(q38._embed_shard_reasons(full, 2, 0)) == 1
 
 
 def test_the_mtp_draft_views_are_checked():

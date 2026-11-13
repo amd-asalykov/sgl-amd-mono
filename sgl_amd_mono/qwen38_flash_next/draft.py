@@ -138,6 +138,10 @@ SGLANG_READS = {
     "srt/distributed/parallel_state.py": ("cpu_group",),
 }
 
+# the TP sizes the draft launch serves: TP > 1 drafts run SGLang's MTP forward until
+# the draft launch is validated there (TP_PLAN commit 8)
+TP_SIZES = (1,)
+
 # The draft runs on its own QSA backends whatever --speculative-draft-attention-backend
 # says (speculative/draft_utils.py stamps them "qsa"); the launch writes their caches.
 DRAFT_ATTENTION_BACKENDS = frozenset({"qsa"})
@@ -155,8 +159,8 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
 
     reasons = []
     tp = get_parallel().tp_size
-    if tp not in target.TP_SIZES:
-        reasons.append(f"the draft launch runs the MTP layer at TP {target.TP_SIZES}")
+    if tp not in TP_SIZES:
+        reasons.append(f"the draft launch runs the MTP layer at TP {TP_SIZES}")
         return reasons
     return reasons + weights.mtp_reasons(model, tp)
 
@@ -491,7 +495,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(
             widths=tuple(range(1, target.MAX_R * target.TOKENS + 1)),
-            tp_sizes=target.TP_SIZES,
+            tp_sizes=TP_SIZES,
             resident_blocks=BLOCKS,
         )
     },

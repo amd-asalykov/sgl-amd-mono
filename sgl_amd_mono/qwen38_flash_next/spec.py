@@ -68,12 +68,11 @@ logger = logging.getLogger(__name__)
 
 MAX_R = 8  # requests a launch takes at most (``gfx950/config.MAX_R``)
 TOKENS = 4  # rows a request: NEXTN's 3 draft steps + 1
-TP = 1
-# the TP sizes the launches serve (``DeviceLimits.tp_sizes``); the geometry, the
-# peer buffers and the collective build are laid out for ``config.TP_SIZES``, but
-# the sharded stages and the in-kernel all-reduce are not there yet (TP_PLAN
-# commits 4-5), so TP > 1 stays refused
-TP_SIZES = (TP,)
+# the TP sizes the launches serve (``DeviceLimits.tp_sizes``): TP 2 runs each rank's
+# shard (GDN heads, QSA q heads and KV head, MoE intermediate, vocab shards) and
+# the all-reduces in the kernel (notes/TP_PLAN.md); TP 4's stages are not there yet
+# (TP_PLAN commit 9)
+TP_SIZES = (1, 2)
 # the verify widths: whole requests of 4 rows, up to 8 (32 rows)
 WIDTHS = tuple(range(TOKENS, MAX_R * TOKENS + 1, TOKENS))
 # the kernel's GDN SSM state dtypes (``gfx950/config.MonoBuild.ssm_bf16``)
@@ -169,9 +168,25 @@ SGLANG_READS = {
         '"attn_cp_size"',
         '"moe_ep_size"',
     ),
+    # TP > 1: the attention and MoE TP groups are the TP group, no DP attention, no
+    # scattered attention-TP input
+    "srt/arg_groups/fields/parallel.py": (
+        "attn_tp_size",
+        "moe_tp_size",
+        "attn_dp_enabled",
+        "enable_attn_tp_input_scattered",
+    ),
+    # TP > 1: the AITER MXFP4 MoE's per-rank padding the kernel reads
+    "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py": (
+        '"SGLANG_AITER_K3_OPT"',
+    ),
     "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/layers/rotary_embedding/base.py": ("cos_sin_cache_as",),
-    "srt/layers/vocab_parallel_embedding.py": ("weight",),
+    "srt/layers/vocab_parallel_embedding.py": (
+        "weight",
+        "shard_indices",
+        "org_vocab_start_index",
+    ),
     "srt/models/qwen3_5.py": (
         "layers",
         "embed_tokens",
@@ -295,11 +310,14 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     m, p = model.model, get_parallel()
     reasons = []
     widths = (p.pp_size, p.attn_cp_size, p.moe_ep_size)
-    if p.tp_size not in TP_SIZES or widths != (1, 1, 1):
+    tp = int(p.tp_size)
+    if tp not in TP_SIZES or widths != (1, 1, 1):
         reasons.append(
             f"TP {p.tp_size} / PP {p.pp_size} / CP {p.attn_cp_size} / EP "
             f"{p.moe_ep_size}: the launches run TP {TP_SIZES} without PP, CP or EP"
         )
+        return reasons
+    reasons += _tp_reasons(p, tp)
     if getattr(model, "capture_aux_hidden_states", False):
         reasons.append("auxiliary hidden states (EAGLE3 / DFLASH): none are captured")
     kinds = _kinds(_text(hf_config))
@@ -314,9 +332,9 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         has_ple = getattr(layer, "ple", None) is not None
         if has_ple != (i == 1):
             reasons.append(f"layer {i}: the kernel runs PLE on layer 1 only")
-        reasons += weights.layer_reasons(layer, i, kind)
+        reasons += weights.layer_reasons(layer, i, kind, tp)
     if getattr(m.layers[1], "ple", None) is not None:
-        reasons += weights.ngram_reasons(m.layers[1].ple)
+        reasons += weights.ngram_reasons(m.layers[1].ple, tp)
     reasons += weights.mixer_reasons(getattr(m, "hyper_connection_mixer", None))
     emb = getattr(getattr(m, "embed_tokens", None), "weight", None)
     if (
@@ -327,9 +345,58 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         or not emb.is_contiguous()
     ):
         reasons.append("the token embedding must be one contiguous bf16 table")
+    elif tp > 1:
+        reasons += _embed_shard_reasons(m.embed_tokens, tp, int(p.tp_rank))
     if not hasattr(getattr(m.layers[3], "rotary_emb", None), "cos_sin_cache_as"):
         reasons.append("layer 3: no rotary embedding with a bf16 cos / sin table")
     return reasons + _context_reason(process_model_config().context_len)
+
+
+def _tp_reasons(p, tp: int) -> list[str]:
+    """TP > 1: the layout the launches read (notes/tp_sglang_sharding.md): attention
+    TP = MoE TP = TP (no DP attention, EP 1), the attention input not scattered over
+    the attention TP group, and AITER's padded MXFP4 MoE shards."""
+    if tp == 1:
+        return []
+    reasons = []
+
+    def read(name, default=None):
+        try:
+            return getattr(p, name)
+        except (AttributeError, RuntimeError, ValueError):
+            return default
+
+    if read("attn_tp_size") != tp or read("moe_tp_size") != tp or read("attn_dp_enabled"):
+        reasons.append(
+            f"TP {tp}: attention TP {read('attn_tp_size')}, MoE TP "
+            f"{read('moe_tp_size')}, DP attention {read('attn_dp_enabled')}: the "
+            "launches shard attention and the MoE over the whole TP group"
+        )
+    if read("enable_attn_tp_input_scattered"):
+        reasons.append(
+            "--enable-attn-tp-input-scattered: the launches read replicated residual streams"
+        )
+    if os.environ.get("SGLANG_AITER_K3_OPT", "0").lower() in ("1", "true", "yes"):
+        reasons.append(
+            "SGLANG_AITER_K3_OPT: the launches read AITER's padded per-rank MXFP4 experts"
+        )
+    return reasons
+
+
+def _embed_shard_reasons(embed, tp: int, rank: int) -> list[str]:
+    """TP > 1: the token embedding is SGLang's vocab shard of rank ``rank`` (rows
+    [rank V / tp, (rank + 1) V / tp), no pad rows): the launches look a token up on
+    its owner rank and exchange the row."""
+    from sgl_amd_mono.qwen38_flash_next.gfx950.config import VOCAB
+
+    rows = VOCAB // tp
+    start = getattr(getattr(embed, "shard_indices", None), "org_vocab_start_index", None)
+    if embed.weight.shape[0] != rows or start != rank * rows:
+        return [
+            f"the token embedding shard {tuple(embed.weight.shape)} from row {start}: "
+            f"the launches read TP {tp} rank {rank}'s {rows} rows from {rank * rows}"
+        ]
+    return []
 
 
 def agreed(group, ok: bool) -> bool:
@@ -416,7 +483,7 @@ class _Built:
         out = lm.logits_processor(input_ids, x, lm.lm_head, forward_batch, None)
         out.hidden_states = hidden
         if ref is not None:
-            check.compare(ref, out, forward_batch)
+            check.compare(ref, out, forward_batch, self.runner)
         return out
 
 
@@ -471,7 +538,7 @@ def _build(model, hf_config, ctx) -> _Built:
     if built.check:
         from sgl_amd_mono.qwen38_flash_next import check
 
-        check.weights(model, kinds)
+        check.weights(model, kinds, tp, rank)
     # The launches compile the cache strides in, and SGLang sizes the caches after
     # the build: each batch size's launches compile at its first forward (the
     # decode graph runner's eager warmup), then come from FlyDSL's disk cache.
