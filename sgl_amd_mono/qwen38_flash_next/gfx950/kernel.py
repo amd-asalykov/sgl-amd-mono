@@ -998,6 +998,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                     for c in range(CPW)
                 ]
+                # static norm weights of the down's Hn items: issued with the weights, before the H poll
                 r_wn = _rsrc(ptr(layer, p_norm))
                 mixd = mb(layer, hc + ".mixd")
                 mixx = mb(layer, hc + ".mixx")
@@ -1011,6 +1012,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     else:
                         q = fx.min(tid + i * THREADS, NQ - 1)
                         hitems.append((q // 256, q % 256))
+                wvs = [
+                    bo.buffer_load(r_wn, (k0 + 4 * j) // 2, vec_width=2, dtype=T.i32)
+                    for _, j in hitems
+                ]
                 if const_expr(src[0] == "embed"):
                     embed_rstd(src)
                     hvs = h_quads(src, [(t, k0 // 4 + j) for t, j in hitems])
@@ -1078,9 +1083,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         t, j = hitems[n_]
                         k = k0 + 4 * j
                         wv = (
-                            fx.Vector(
-                                bo.buffer_load(r_wn, k // 2, vec_width=2, dtype=T.i32)
-                            )
+                            fx.Vector(wvs[n_])
                             .bitcast(fx.BFloat16)
                             .to(fx.Float32)
                         )
@@ -1135,6 +1138,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             coef=(kk < NKC_U).select(fx.Float32(1.0), fx.Float32(0.0)),
                         )
                     )
+                # static norm weights of this thread's up outputs, issued before the mixd poll (not at T = 8: there
+                # the early load moves the mix-up register peak into 11 more VGPR spills)
+                WN_EARLY = NT != 8
+                wns = []
+                for p_ in range_constexpr((64 * NT + THREADS - 1) // THREADS):
+                    o_ = fx.min(tid + p_ * THREADS, 64 * NT - 1)
+                    k = ((o_ % 64) // 16) * HIDDEN + u * 16 + o_ % 16
+                    if const_expr(WN_EARLY):
+                        wns.append(bo.buffer_load(r_wn, k, vec_width=1, dtype=T.bf16))
                 if is_up:
                     NPP = NT * (HC_LOWRANK // 2)
                     NI = (NPP + THREADS - 1) // THREADS
@@ -1217,7 +1229,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             hv = (k % 2 == 0).select(lo, hi)
                             wn = fx.Float32(
                                 fx.BFloat16(
-                                    bo.buffer_load(r_wn, k, vec_width=1, dtype=T.bf16)
+                                    wns[p_]
+                                    if const_expr(WN_EARLY)
+                                    else bo.buffer_load(
+                                        r_wn, k, vec_width=1, dtype=T.bf16
+                                    )
                                 )
                             )
                             lds_st(
@@ -1249,12 +1265,42 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                     gpu.barrier()
 
+            def combine_specs(layer, hc, src, rg, i, ok=None):
+                """Poll specs of combine item i: [residual word (mailbox src)] + the MIX_KSPLIT combine-gate partials."""
+                q = tid + i * THREADS
+                if const_expr(ok is not None):
+                    q = fx.min(q, 32 * NT - 1)
+                t = q // 32
+                b = (q % 32) // 8
+                p = q % 8
+                row = b * HIDDEN + rg * 16 + p * 2
+                injp = mb(layer, hc + ".injp")
+                okt = () if ok is None else (ok,)
+                sp = [
+                    (injp, (s_ * NT + t) * 4 + b, 1) + okt
+                    for s_ in range(LY.MIX_KSPLIT)
+                ]
+                if const_expr(src[0] == "mb"):
+                    sp = [(src[1], t * (HC_DIM // 2) + row // 2, 1) + okt] + sp
+                return sp
+
+            def combine_pre(layer, hc, src, rg):
+                """combine_rows' inputs (written a stage earlier, so ready) as ok-masked poll specs for all threads, to
+                append to an earlier poll batch; feed the results to combine_rows(pre=...). One item per thread
+                (T <= 16)."""
+                NQ = 32 * NT
+                assert NQ <= THREADS
+                if const_expr(NQ == THREADS):
+                    return combine_specs(layer, hc, src, rg, 0)
+                return combine_specs(layer, hc, src, rg, 0, tid < NQ)
+
             def combine_rows(
-                layer, hc, src, rg, block_val, dst, dst_ssq, out_global=False
+                layer, hc, src, rg, block_val, dst, dst_ssq, out_global=False, pre=None
             ):
                 """dst[t, b*HIDDEN + 16 rg + r] = H + block_out[t, 16 rg + r] * gate[t, b], the combine gate
                 2 sigmoid(Hn[t] . Winj_b / HC) from the mix's per-slice partials (tid < 32 T); plus the per-(t, b)
-                sum-of-squares partial rg of the new stream. block_val(p, t) -> (v0, v1)."""
+                sum-of-squares partial rg of the new stream. block_val(p, t) -> (v0, v1). pre: the polled
+                combine_pre(...) values (else polled here)."""
                 NQ = 32 * NT
                 for i in range_constexpr((NQ + THREADS - 1) // THREADS):
                     q = tid + i * THREADS
@@ -1263,21 +1309,18 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         b = (q % 32) // 8
                         p = q % 8
                         row = b * HIDDEN + rg * 16 + p * 2
-                        injp = mb(layer, hc + ".injp")
-                        gspecs = [
-                            (injp, (s_ * NT + t) * 4 + b, 1)
-                            for s_ in range(LY.MIX_KSPLIT)
-                        ]
                         # one batched poll: residual word + combine-gate partials
+                        got = (
+                            pre
+                            if const_expr(pre is not None)
+                            else poll(combine_specs(layer, hc, src, rg, i))
+                        )
                         if const_expr(src[0] == "mb"):
-                            got = poll(
-                                [(src[1], t * (HC_DIM // 2) + row // 2, 1)] + gspecs
-                            )
                             hw = got[0][0]
                             gp = got[1:]
                         else:
                             hw = h_words(src, t, [row // 2])[0]
-                            gp = poll(gspecs)
+                            gp = got
                         gsum = gp[0][0].bitcast(fx.Float32)
                         for s_ in range_constexpr(1, LY.MIX_KSPLIT):
                             gsum = gsum + gp[s_][0].bitcast(fx.Float32)
@@ -2182,7 +2225,6 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 is_op = optask < LY.OUT_RG
                 rg = fx.min(optask, LY.OUT_RG - 1)
                 r_w = rsrc_if(ptr(layer, LY.P_OUT), is_op, HIDDEN * GDN_VAL_DIM)
-                r_ws = _rsrc(ptr(layer, LY.P_OUT_S))
                 NKC = GDN_VAL_DIM // 128  # 48 chunks of 128 K
                 NKH = NKC // OP_KS  # chunks per staged K part
                 CPW = NKH // WAVES
@@ -2284,14 +2326,36 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     gdn_scale_part(list(range(NIA)), got)
                     gdn_scale_finish()
 
+                units0 = part_units(0)
+                # weight row scales of the epilogue: issued with the part-0 weights
+                r_ws = _rsrc(ptr(layer, LY.P_OUT_S))
+                wsv = [
+                    bo.buffer_load(
+                        r_ws,
+                        rg * 16 + fx.min(tid + p0, 16 * NT - 1) % 16,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                    for p0 in range(0, 16 * NT, THREADS)
+                ]
+                # combine inputs (residual + combine-gate partials, ready since mix a): in the og_amax poll
+                CPRE = NT <= 16
+                cpre = combine_pre(layer, "a", src, rg) if CPRE else []
+                # S = 4: the scale partials and the combine inputs are polled with the og
+                cbox = [None]
+
+                def gdn_fused_fn(got):
+                    if const_expr(CPRE):
+                        cbox[0] = got[NIA:]
+                    gdn_scale_all(got[:NIA])
+
                 gdn_extra = (
-                    (gdn_scale_specs(list(range(NIA))), gdn_scale_all)
+                    (gdn_scale_specs(list(range(NIA))) + cpre, gdn_fused_fn)
                     if GDN_FUSED
                     else None
                 )
-
-                units0 = part_units(0)
                 if is_op:
+                    cgot = None
                     # og part 0 lands while the producers' amax partials are reduced below
                     if const_expr(QB):
                         stage_bf16_mb(
@@ -2307,7 +2371,12 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         if const_expr(NORM_IN_OP and not GDN_FUSED):
                             for i0 in range_constexpr(0, NIA, AB):
                                 ii = list(range(i0, min(i0 + AB, NIA)))
-                                gdn_scale_part(ii, poll(gdn_scale_specs(ii)))
+                                # the combine inputs ride with the first scale round
+                                cx = cpre if i0 == 0 else []
+                                got = poll(gdn_scale_specs(ii) + cx, len(ii) + len(cx))
+                                if const_expr(CPRE and i0 == 0):
+                                    cgot = got[len(ii) :]
+                                gdn_scale_part(ii, got[: len(ii)])
                             gdn_scale_finish()
                         if const_expr(not NORM_IN_OP):
                             # row amax = max over the core tasks' max |og| (a wave's 64 tasks lie in one row)
@@ -2321,10 +2390,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                         (og_amax, fx.min(tid + i * THREADS, NA0 - 1), 1)
                                         for i in range(NIA0)
                                     ]
+                                    + cpre,
+                                    max(POLL_MAX, NIA0 + len(cpre)),
                                 )
                                 if NT <= 16
                                 else None
                             )
+                            if const_expr(CPRE):
+                                cgot = vam[NIA0:]
                             for i in range_constexpr(NIA0):
                                 if const_expr(NT <= 16):
                                     v = vam[i][0].bitcast(fx.Float32)
@@ -2348,9 +2421,24 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     xs, AINV + tid, fx.Float32(1.0) / (am * (1.0 / 448.0))
                                 )
                     else:
-                        if tid < NT:  # merge tasks published max |og| per (row, head)
-                            got = poll(
-                                [(og_amax, tid * 24 + h_, 1) for h_ in range(24)]
+                        # merge tasks published max |og| per (row, head); rows tid < NT (+ the combine inputs)
+                        if const_expr(CPRE):
+                            gall = poll(
+                                [
+                                    (og_amax, fx.min(tid, NT - 1) * 24 + h_, 1, tid < NT)
+                                    for h_ in range(24)
+                                ]
+                                + cpre,
+                                24 + len(cpre),
+                            )
+                            cgot = gall[24:]
+                        if tid < NT:
+                            got = (
+                                gall
+                                if const_expr(CPRE)
+                                else poll(
+                                    [(og_amax, tid * 24 + h_, 1) for h_ in range(24)]
+                                )
                             )
                             am = got[0][0].bitcast(fx.Float32)
                             for h_ in range_constexpr(1, 24):
@@ -2361,7 +2449,6 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 xs, AINV + tid, fx.Float32(1.0) / (am * (1.0 / 448.0))
                             )
                     gpu.barrier()
-                if is_op:
                     if const_expr(not QB):
                         stage_f8_mb(
                             mb(layer, "og"),
@@ -2374,7 +2461,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             inv_of=gdn_inv,
                             extra=gdn_extra,
                         )
-                if is_op:
+                        if const_expr(GDN_FUSED and CPRE):
+                            cgot = cbox[0]
                     # K part hh + 1: weights issued before the MMA of part hh (the og polls of part hh are done)
                     nxt = part_units(1) if OP_KS > 1 else None
                     acc = mma_units(zero_acc(), units0)
@@ -2413,11 +2501,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         if q < 16 * NT:
                             r = q % 16
                             t = q // 16
-                            ws = fx.Float32(
-                                bo.buffer_load(
-                                    r_ws, rg * 16 + r, vec_width=1, dtype=T.f32
-                                )
-                            )
+                            ws = fx.Float32(wsv[p0 // THREADS])
                             ov_ = red_rows(0, WAVES, r, t) * ws * lds_ld(xs, ASC + t)
                             lds_st(xs, OUTS + q, ov_)
                     gpu.barrier()
@@ -2432,6 +2516,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ),
                         mb(layer, "h1"),
                         mb(layer, "h1ssq"),
+                        pre=cgot,
                     )
                     gpu.barrier()
 
@@ -2926,6 +3011,23 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # (poll rounds of NGC groups, only the ng live groups)
                     NGC = 16
                     nround = (ng + NGC - 1) // NGC
+                    # combine inputs (residual + combine-gate partials, ready since mix m): in the first dpart poll
+                    # (T <= 16; T = 32 has 2 items per thread and keeps the separate poll)
+                    CPRE = NT <= 16
+                    cpre = combine_pre(layer, "m", h1_src, rg) if CPRE else []
+                    cgot = None
+
+                    def dspecs(g0, t, r, qok):
+                        return [
+                            (
+                                dpart,
+                                ((g0 + i) * NT + t) * HIDDEN + rg * 16 + r,
+                                1,
+                                qok & (g0 + i < ng),
+                            )
+                            for i in range(NGC)
+                        ]
+
                     for p0 in range_constexpr(0, 16 * NT, THREADS):
                         q = tid + p0
                         qok = q < 16 * NT
@@ -2933,22 +3035,24 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         t = qc // 16
                         r = qc % 16
                         res = None
+                        it0 = 0
+                        init0 = fx.Float32(0.0)
+                        if const_expr(CPRE and p0 == 0):
+                            # round 0 peeled: the same sum order (tot carries across rounds)
+                            vs = poll(
+                                dspecs(fx.Int32(0), t, r, qok) + cpre,
+                                NGC + len(cpre),
+                            )
+                            cgot = vs[NGC:]
+                            for i in range_constexpr(NGC):
+                                init0 = init0 + vs[i][0].bitcast(fx.Float32)
+                            it0 = 1
                         for it, st in range(
-                            fx.Int32(0), nround, 1, init=[fx.Float32(0.0)]
+                            fx.Int32(it0), nround, 1, init=[init0]
                         ):
                             it = fx.Int32(it)
                             g0 = it * NGC
-                            vs = poll(
-                                [
-                                    (
-                                        dpart,
-                                        ((g0 + i) * NT + t) * HIDDEN + rg * 16 + r,
-                                        1,
-                                        qok & (g0 + i < ng),
-                                    )
-                                    for i in range(NGC)
-                                ]
-                            )
+                            vs = poll(dspecs(g0, t, r, qok))
                             tot = st[0]
                             for i in range_constexpr(NGC):
                                 tot = tot + vs[i][0].bitcast(fx.Float32)
@@ -2971,6 +3075,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         mb(layer, "h2"),
                         mb(layer, "h2ssq"),
                         out_global,
+                        pre=cgot,
                     )
                     gpu.barrier()
 
