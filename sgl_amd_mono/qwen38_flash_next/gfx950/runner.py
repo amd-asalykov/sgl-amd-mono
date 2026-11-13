@@ -35,7 +35,7 @@ from sgl_amd_mono.common import guard
 
 from . import layout as LY
 from . import packing
-from .config import HC_DIM, HIDDEN, MAX_T, ConvStrides, MonoBuild
+from .config import HC_DIM, HIDDEN, MAX_T, VOCAB, ConvStrides, MonoBuild
 
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -235,13 +235,39 @@ class _Base:
         dist.barrier(group=self.cpu_group)
         self._synced.add(R)
 
+    def shard_rows(self, g: list, embed_w: torch.Tensor, ngram: Optional[dict]) -> None:
+        """TP > 1: the rows of this rank's vocab shards of the token embedding and the
+        PLE n-gram table into global row ``g``. The kernel finds a row's owner rank
+        (global id // rows) and the owner pushes the row to every rank (region X of
+        the peer buffer); the shards are SGLang's, read in place."""
+        if self.tp == 1:
+            return
+        g[LY.G_VOCAB_ROWS] = int(embed_w.shape[0])
+        if ngram is not None:
+            g[LY.G_NGRAM_ROWS] = int(ngram["table"].shape[0])
+
+    def check_shards(self, embed_w: torch.Tensor, ngram: Optional[dict]) -> None:
+        """TP > 1: rank r's shards start at global row r x their rows (SGLang's
+        VocabParallelEmbedding without pad rows), which the owner lookup assumes."""
+        if self.tp == 1:
+            return
+        rows = int(embed_w.shape[0])
+        if rows * self.tp != VOCAB or embed_w.shape[1] != HIDDEN:
+            raise ValueError(
+                f"Qwen3.8-Flash-Next monokernel: TP {self.tp} embedding shard "
+                f"{tuple(embed_w.shape)}"
+            )
+        if ngram is not None:
+            n = int(ngram["table"].shape[0])
+            if int(ngram.get("start", 0)) != self.rank * n:
+                raise ValueError(
+                    f"Qwen3.8-Flash-Next monokernel: rank {self.rank}'s PLE n-gram "
+                    f"shard starts at row {ngram.get('start')}, not {self.rank * n}"
+                )
+
     def refuse_tp_launch(self) -> None:
         """TP 4 runs no launch yet (its stages: a 64-K out_proj unit, core_split 16,
-        6 q heads an attention task; TP_PLAN commit 9). TP 2 launches run the
-        sharded stages and the in-kernel all-reduces; SGLang still routes TP > 1
-        away (``spec.TP_SIZES``) until the prelude's vocab-shard exchange and check
-        mode exist (TP_PLAN commits 6-7): the prelude reads a full (replicated)
-        embedding and n-gram table."""
+        6 q heads an attention task; TP_PLAN commit 9)."""
         if self.tp > 2:
             raise NotImplementedError(
                 f"Qwen3.8-Flash-Next monokernel: TP {self.tp} launches are not "
@@ -397,6 +423,7 @@ class VerifyRunner(_Base):
         super().__init__(device, eos_token_id, fault, tp, rank, cpu_group)
         self.kinds, self.layers, self.final, self.ngram = kinds, layers, final, ngram
         self.embed_w = embed_w
+        self.check_shards(embed_w, ngram)
         self.cos_sin = cos_sin  # () -> SGLang's bf16 RoPE table (a cached cast)
         self.L, self.max_reqs = int(ntok), int(max_reqs)
         self.plans = launch_plans(kinds)
@@ -600,6 +627,7 @@ class VerifyRunner(_Base):
             g[LY.G_NGRAM_CTX] = ngram_ctx.data_ptr()
             g[LY.G_NGRAM_META] = self.ngram["meta"].data_ptr()
             g[LY.G_NGRAM_ICTX] = ngram_ictx[0].data_ptr()
+            self.shard_rows(g, self.embed_w, self.ngram)
             # launch i's streams: h_bufs[(i - 1) % 2] -> h_bufs[i % 2], with their
             # sum-of-squares partials
             g[LY.G_HIN_SSQ] = self.ssq_bufs[(launch - 1) % 2].data_ptr()
@@ -714,6 +742,7 @@ class DraftRunner(_Base):
     ):
         super().__init__(device, eos_token_id, fault, tp, rank, cpu_group)
         self.views, self.embed_w, self.cos_sin = views, embed_w, cos_sin
+        self.check_shards(embed_w, None)
         self.layer_id = layer_id
         self.L_ext, self.max_reqs = int(ntok_extend), int(max_reqs)
         S = self.max_reqs * self.L_ext
@@ -783,6 +812,7 @@ class DraftRunner(_Base):
         )
         g[LY.G_INPUT_IDS] = self.ids_buf.data_ptr()
         g[LY.G_EMBED_W] = self.embed_w.data_ptr()
+        self.shard_rows(g, self.embed_w, None)
         g[LY.G_MTP_HIN] = hidden_states.data_ptr()
         g[LY.G_FIN_OUT] = self.x_buf.data_ptr()
         g[LY.G_HOUT_SSQ] = self.ssq_buf.data_ptr()

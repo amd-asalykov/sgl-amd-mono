@@ -918,7 +918,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
             # ---- residual-stream sources
             # src = (kind, addr, ssq_kind, ssq_addr, nparts): kind "global" (bf16 [T][HC_DIM]), "mb" (pairs),
-            # "embed" (token embedding rows, 4 identical branches; tokens in LDS EMB_TOK)
+            # "embed" (token embedding rows, 4 identical branches; tokens in LDS EMB_TOK), "xemb" (TP > 1: the same
+            # rows from region X of this rank's peer buffer, row t at pair t * X_ROW_PAIRS; embed_rstd polls every
+            # word of every row on every CTA first, so the reads after it are plain loads)
 
             def h_words(src, t, word_idx):
                 """[(t, w) for w in word_idx] -> Int32 bf16 pairs of H (one batched poll for mailboxes)."""
@@ -939,6 +941,20 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                         )
                     return out
+                if const_expr(kind == "xemb"):
+                    r = _rsrc(addr)
+                    return [
+                        fx.Int32(
+                            bo.buffer_load(
+                                r,
+                                (t * LY.X_ROW_PAIRS + w % (HIDDEN // 2)) * 2,
+                                vec_width=1,
+                                dtype=T.i32,
+                                cache_modifier=CM_SYS,
+                            )
+                        )
+                        for w in word_idx
+                    ]
                 if const_expr(kind == "global"):
                     r = _rsrc(addr)
                     return [
@@ -972,6 +988,20 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 )
                             )
                         )
+                elif const_expr(kind == "xemb"):
+                    r = _rsrc(addr)
+                    ws = []
+                    for t, q in tq:
+                        v = fx.Vector(
+                            bo.buffer_load(
+                                r,
+                                (t * LY.X_ROW_PAIRS + 2 * (q % (HIDDEN // 4))) * 2,
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=CM_SYS,
+                            )
+                        )
+                        ws.append(fx.Vector.from_elements([v[0], v[2]], fx.Int32))
                 elif const_expr(kind == "global"):
                     r = _rsrc(addr)
                     ws = [
@@ -995,12 +1025,36 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 """LDS MIX_RSTD[t][b] = rsqrt(mean(H[t, branch b]^2) + eps) of an "embed" source (every CTA): one
                 embedding row per token, identical for the 4 branches."""
                 NQ = HIDDEN // 4
+                NI = (NQ + THREADS - 1) // THREADS
+                if const_expr(src[0] == "xemb"):
+                    # TP > 1: wait for every word of every row here (batched polls of region X)
+                    xg = poll(
+                        [
+                            (
+                                src[1],
+                                t * LY.X_ROW_PAIRS + 2 * fx.min(tid + i * THREADS, NQ - 1),
+                                2,
+                                None,
+                                CM_SYS,
+                                peer_tag(0),
+                            )
+                            for t in range(NT)
+                            for i in range(NI)
+                        ]
+                    )
                 vals = []
                 for t in range_constexpr(NT):
                     acc = fx.Float32(0.0)
-                    for i in range_constexpr((NQ + THREADS - 1) // THREADS):
+                    for i in range_constexpr(NI):
                         q = tid + i * THREADS
-                        hv = h_quads(src, [(t, fx.min(q, NQ - 1))])[0]
+                        if const_expr(src[0] == "xemb"):
+                            hv = (
+                                fx.Vector.from_elements(xg[t * NI + i], fx.Int32)
+                                .bitcast(fx.BFloat16)
+                                .to(fx.Float32)
+                            )
+                        else:
+                            hv = h_quads(src, [(t, fx.min(q, NQ - 1))])[0]
                         s = (
                             hv[0] * hv[0]
                             + hv[1] * hv[1]
@@ -1071,7 +1125,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     bo.buffer_load(r_wn, (k0 + 4 * j) // 2, vec_width=2, dtype=T.i32)
                     for _, j in hitems
                 ]
-                if const_expr(src[0] == "embed"):
+                if const_expr(src[0] in ("embed", "xemb")):
                     embed_rstd(src)
                     hvs = h_quads(src, [(t, k0 // 4 + j) for t, j in hitems])
                 else:
@@ -1387,6 +1441,47 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     v0 = v0 + lo
                     v1 = v1 + hi
                 return bf_round(v0), bf_round(v1)
+
+            # ---- TP > 1: the vocab-sharded token embedding and PLE n-gram table (region X). SGLang looks a row up
+            # on the rank whose shard holds it (zeros elsewhere) and all-reduces: one nonzero term, so the sum is
+            # the row, bitwise. Here the owner rank pushes the row to row t of every rank's region X (its own too)
+            # and each rank polls its own copy: one hop, no sum.
+            def x_own():
+                return sym + peer_region("X")
+
+            def x_owner(gid, rows):
+                """(owner rank, row in its shard) of global row ``gid`` of a table sharded ``rows`` rows a rank."""
+                o = fx.Int64(fx.Uint64(gid) // fx.Uint64(rows))
+                o = (o > fx.Int64(TPW - 1)).select(fx.Int64(TPW - 1), o)
+                return o, gid - o * rows
+
+            def x_store(pair, words):
+                """Pairs ``pair``.. of region X of every rank := (w, tag) for w in ``words`` (1 or 2), one store."""
+                ptag = peer_tag(0)
+                vals = []
+                for w in words:
+                    vals += [w, ptag]
+                for dst in range_constexpr(TPW):
+                    bo.buffer_store(
+                        fx.Vector.from_elements(vals, fx.Int32),
+                        _rsrc(load_ptr64(peers, dst) + peer_region("X")),
+                        pair * 2,
+                        cache_modifier=CM_SYS,
+                    )
+
+            def xemb_push(t, tok):
+                """The whole CTA: token ``tok``'s embedding row -> row t of region X, if this rank owns it."""
+                own, loc = x_owner(fx.Int64(tok), ptr(GI, LY.G_VOCAB_ROWS))
+                if own == fx.Int64(rank):
+                    r_row = _rsrc(ptr(GI, LY.G_EMBED_W) + loc * (HIDDEN * 2))
+                    NQ2 = LY.X_EMB_PAIRS // 2
+                    for i0 in range_constexpr(0, NQ2, THREADS):
+                        q = tid + i0
+                        if q < NQ2:
+                            w = fx.Vector(
+                                bo.buffer_load(r_row, q * 2, vec_width=2, dtype=T.i32)
+                            )
+                            x_store(t * LY.X_ROW_PAIRS + 2 * q, [w[0], w[1]])
 
             def combine_specs(layer, hc, src, rg, i, ok=None):
                 """Poll specs of combine item i: [residual word (mailbox src)] + the MIX_KSPLIT combine-gate partials."""
@@ -4717,6 +4812,34 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         lds_st(xi, PREP_OFF + 2 * tid, fx.Int32(nid))
                         lds_st(xi, PREP_OFF + 2 * tid + 1, fx.Int32(nid >> 32))
                     gpu.barrier()
+                    DW = LY.NGRAM_DIM // 4  # 40 dwords per head row
+                    XNG = LY.X_EMB_PAIRS  # region X: the n-gram heads after the embedding
+                    if const_expr(TPW > 1):
+                        # the owner pushes row t's token embedding and its n-gram heads' FP8 rows (raw words)
+                        xemb_push(t, _uniform(lds_ld(xi, EMB_TOK + t)))
+                        for rr in range_constexpr((NH + WAVES - 1) // WAVES):
+                            hd = wave + WAVES * rr
+                            if hd < NH:
+                                lo = _uniform(lds_ld(xi, PREP_OFF + 2 * hd))
+                                hi = _uniform(lds_ld(xi, PREP_OFF + 2 * hd + 1))
+                                own, loc = x_owner(
+                                    (fx.Int64(hi) << 32) | fx.Int64(fx.Uint32(lo)),
+                                    ptr(GI, LY.G_NGRAM_ROWS),
+                                )
+                                if own == fx.Int64(rank):
+                                    r_row = _rsrc(
+                                        ptr(GI, LY.G_NGRAM_W) + loc * LY.NGRAM_DIM
+                                    )
+                                    if lane < DW:
+                                        word = fx.Int32(
+                                            bo.buffer_load(
+                                                r_row, lane, vec_width=1, dtype=T.i32
+                                            )
+                                        )
+                                        x_store(
+                                            t * LY.X_ROW_PAIRS + XNG + hd * DW + lane,
+                                            [word],
+                                        )
                     scale = fx.Float32(
                         fx.BFloat16(
                             bo.buffer_load(
@@ -4728,23 +4851,37 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         )
                     )
                     r_emb = _rsrc(ptr(GI, LY.G_PLE_EMB))
-                    DW = LY.NGRAM_DIM // 4  # 40 dwords per head row
                     for rr in range_constexpr((NH + WAVES - 1) // WAVES):
                         hd = wave + WAVES * rr
                         if hd < NH:
-                            lo = _uniform(lds_ld(xi, PREP_OFF + 2 * hd))
-                            hi = _uniform(lds_ld(xi, PREP_OFF + 2 * hd + 1))
-                            rowaddr = (
-                                ptr(GI, LY.G_NGRAM_W)
-                                + ((fx.Int64(hi) << 32) | fx.Int64(fx.Uint32(lo)))
-                                * LY.NGRAM_DIM
-                            )
-                            if lane < DW:
-                                word = fx.Int32(
-                                    bo.buffer_load(
-                                        _rsrc(rowaddr), lane, vec_width=1, dtype=T.i32
-                                    )
+                            if const_expr(TPW == 1):
+                                lo = _uniform(lds_ld(xi, PREP_OFF + 2 * hd))
+                                hi = _uniform(lds_ld(xi, PREP_OFF + 2 * hd + 1))
+                                rowaddr = (
+                                    ptr(GI, LY.G_NGRAM_W)
+                                    + ((fx.Int64(hi) << 32) | fx.Int64(fx.Uint32(lo)))
+                                    * LY.NGRAM_DIM
                                 )
+                            if lane < DW:
+                                if const_expr(TPW == 1):
+                                    word = fx.Int32(
+                                        bo.buffer_load(
+                                            _rsrc(rowaddr), lane, vec_width=1, dtype=T.i32
+                                        )
+                                    )
+                                else:
+                                    word = poll(
+                                        [
+                                            (
+                                                x_own(),
+                                                t * LY.X_ROW_PAIRS + XNG + hd * DW + lane,
+                                                1,
+                                                None,
+                                                CM_SYS,
+                                                peer_tag(0),
+                                            )
+                                        ]
+                                    )[0][0]
                                 one = fx.Float32(1.0).ir_value()
                                 vals = []
                                 for half in range_constexpr(2):
@@ -4807,7 +4944,28 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 NQE = HIDDEN // 4
                 NQH = HC_DIM // 4
 
+                if const_expr(TPW > 1):
+                    # the vocab-sharded embedding: CTA t < S pushes row t if this rank owns its token (region X)
+                    if bid < NT:
+                        xemb_push(bid, _uniform(lds_ld(xi, EMB_TOK + bid)))
+
                 def emb_quad(t, q):
+                    if const_expr(TPW > 1):
+                        # (every word was polled by this CTA's row norms)
+                        w = fx.Vector(
+                            bo.buffer_load(
+                                _rsrc(x_own()),
+                                (t * LY.X_ROW_PAIRS + 2 * q) * 2,
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=CM_SYS,
+                            )
+                        )
+                        return (
+                            fx.Vector.from_elements([w[0], w[2]], fx.Int32)
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
                     tok = lds_ld(xi, EMB_TOK + t)
                     w = fx.Vector(
                         bo.buffer_load(
@@ -4832,8 +4990,29 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     t = t0 + wave
                     if t < NT:
                         ae = fx.Float32(0.0)
+                        if const_expr(TPW > 1):
+                            xg = poll(
+                                [
+                                    (
+                                        x_own(),
+                                        t * LY.X_ROW_PAIRS + 2 * (lane + 64 * i),
+                                        2,
+                                        None,
+                                        CM_SYS,
+                                        peer_tag(0),
+                                    )
+                                    for i in range(NQE // 64)
+                                ]
+                            )
                         for i in range_constexpr(NQE // 64):
-                            v = emb_quad(t, lane + 64 * i)
+                            if const_expr(TPW > 1):
+                                v = (
+                                    fx.Vector.from_elements(xg[i], fx.Int32)
+                                    .bitcast(fx.BFloat16)
+                                    .to(fx.Float32)
+                                )
+                            else:
+                                v = emb_quad(t, lane + 64 * i)
                             ae = (
                                 ae
                                 + v[0] * v[0]
@@ -5163,7 +5342,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ),
                     )
                 gpu.barrier()
-                src = ("embed", ptr(GI, LY.G_EMBED_W))
+                if const_expr(TPW == 1):
+                    src = ("embed", ptr(GI, LY.G_EMBED_W))
+                else:
+                    src = ("xemb", x_own())
                 stage_prelude()
                 mark("prelude")
                 tid = fresh(tid0)

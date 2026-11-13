@@ -359,6 +359,45 @@ def test_peer_layout_size():
         LY.peer_layout(2, 33)
 
 
+@pytest.mark.parametrize("tp", [2, 4])
+def test_region_x_holds_the_vocab_rows(tp):
+    # region X (TP_PLAN commit 6): row t = the token embedding (1280 bf16 pairs), then
+    # the 16 n-gram heads' FP8 rows (40 words each), MAX_T rows in one region-parity
+    assert LY.X_EMB_PAIRS == HIDDEN // 2
+    assert LY.X_ROW_PAIRS == LY.X_EMB_PAIRS + LY.NGRAM_HEADS * LY.NGRAM_DIM // 4
+    pl = LY.peer_layout(tp, C.MAX_T)
+    assert C.MAX_T * LY.X_ROW_PAIRS * 8 <= pl["_parity"]
+    assert pl["X"] + 2 * pl["_parity"] <= pl["flags"]
+
+
+def test_shard_rows_and_starts():
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
+
+    emb = torch.empty(C.VOCAB // 2, HIDDEN, device=META)
+    table = torch.empty(LY.geom(2).NGRAM_ROWS, LY.NGRAM_DIM, device=META)
+    for rank in (0, 1):
+        r = object.__new__(R.VerifyRunner)
+        r.tp, r.rank = 2, rank
+        ngram = {"table": table, "start": rank * table.shape[0]}
+        r.check_shards(emb, ngram)
+        g = [0] * LY.N_PTR
+        r.shard_rows(g, emb, ngram)
+        assert g[LY.G_VOCAB_ROWS] == C.VOCAB // 2
+        assert g[LY.G_NGRAM_ROWS] == C.NGRAM_ROWS // 2
+        with pytest.raises(ValueError):  # a shard from another rank's row
+            r.check_shards(emb, {"table": table, "start": (1 - rank) * table.shape[0]})
+        with pytest.raises(ValueError):  # the full (replicated) embedding
+            r.check_shards(torch.empty(C.VOCAB, HIDDEN, device=META), ngram)
+    # the free global slots the shard rows take
+    used = [v for k, v in vars(LY).items() if k.startswith("G_") and k not in ("G_VOCAB_ROWS", "G_NGRAM_ROWS")]  # fmt: skip
+    assert LY.G_VOCAB_ROWS not in used and LY.G_NGRAM_ROWS not in used
+    r1 = object.__new__(R.VerifyRunner)
+    g = [0] * LY.N_PTR
+    r1.shard_rows(g, emb, None)  # TP 1: nothing
+    r1.check_shards(emb, None)
+    assert not any(g)
+
+
 def test_launch_parity_alternates():
     # consecutive launches always use the other half, across step boundaries too
     seq = [LY.verify_parity(s, i) for s in range(4) for i in range(LY.LAUNCHES_PER_VERIFY)]

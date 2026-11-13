@@ -255,7 +255,10 @@ BA_ROWS = 128  # SGLang pads in_proj_ba (96 rows) to 128 for AITER's CK GEMM
 # global row (index n_layers of the table)
 G_POS, G_LOC, G_REQ, G_SEQ = 0, 1, 2, 3
 G_RTT, G_COS, G_ROPEPOS, G_MAMBA_MAP = 4, 5, 6, 7
-G_PLE_EMB = 9  # (slot 8 is unused)
+# TP > 1: rows of this rank's vocab shard of the token embedding (SGLang's
+# VocabParallelEmbedding: rank r holds rows [r * n, (r + 1) * n))
+G_VOCAB_ROWS = 8
+G_PLE_EMB = 9
 G_FIN_OUT = 10  # final mixer output x [T, HIDDEN] bf16 (final_mix launches)
 G_HIN_SSQ, G_HOUT_SSQ = 11, 12  # f32 [T, 4, NPART] sum-of-squares of h_in / h_out
 G_INPUT_IDS, G_EMBED_W = 13, 14
@@ -268,6 +271,9 @@ G_MTP_HIN = 20
 # pre_fc_norm_embedding [HIDDEN], pre_fc_norm_hidden [HC_DIM] (bf16)
 G_MTP_PE, G_MTP_PH = 21, 22
 G_MTP_FCE, G_MTP_FCH = 23, 24  # packed bf16 fc_embedding / fc_hidden [HIDDEN, HIDDEN]
+# TP > 1: rows of this rank's vocab shard of the PLE n-gram table (from global row
+# rank * n)
+G_NGRAM_ROWS = 25
 NGRAM_HEADS, NGRAM_DIM, HEADS_PER_NGRAM = 16, 160, 8
 PRELUDE_CTA0 = 224  # CTAs [224, 224 + T): PLE n-gram rows of verify row t
 CONV_SLOT_BYTES = 10240 * 3 * 2  # bf16 [10240, 3] per mamba slot
@@ -481,6 +487,11 @@ def geom(tp: int = 1) -> Geom:
 # ---- the symmetric peer buffer at TP > 1 (``notes/TP_PLAN.md`` decision 3, commit 2)
 PEER_REGIONS = ("A", "F", "X")  # attention AR (out_proj / o_proj), MoE AR (down), prelude
 PEER_ALIGN = 4096
+# region X (the prelude / MTP vocab-shard exchange): a row t of [X_ROW_PAIRS tagged
+# pairs]: the token embedding (X_EMB_PAIRS bf16 pairs), then the 16 PLE n-gram heads'
+# FP8 rows (NGRAM_DIM / 4 words each), each pushed by the rank owning it
+X_EMB_PAIRS = 2560 // 2
+X_ROW_PAIRS = X_EMB_PAIRS + 16 * 160 // 4  # 1920
 PEER_PAIRS_A_TILE = 8  # bf16 pairs a (row group, row) tile line: 16 columns
 LAUNCHES_PER_VERIFY = 13  # odd: the running launch parity alternates across steps
 
@@ -508,6 +519,7 @@ def peer_layout(tp: int, S: int) -> dict:
     assert tp <= FLAG_WORDS
     src = OUT_RG * S * PEER_PAIRS_A_TILE * 8  # = S * HIDDEN * 4 bytes
     part = padded(tp * src, PEER_ALIGN)
+    assert tp == 1 or S * X_ROW_PAIRS * 8 <= part, "region X rows"
     out, off = {}, 0
     for name in PEER_REGIONS:
         out[name] = off
