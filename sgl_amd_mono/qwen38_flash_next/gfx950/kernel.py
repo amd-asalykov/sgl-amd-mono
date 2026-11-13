@@ -120,8 +120,8 @@ def _dump_tl_names(kernel_name, names):
 POLL_MAX = 24
 # TP in BR_TPS, T in {4, 8, 16} (<= BR_MAX_T): branch-aligned mixer K split (4 slices, one a branch; rstd applied after the GEMV)
 BR_MAX_T = 16
-# TPs that take the branch split (TP 2 and TP 4 validated: tp_check, draft, stress, ISA)
-BR_TPS = (2, 4)
+# TPs that take the branch split (TP 2 and TP 4 validated: tp_check, draft, stress, ISA; TP 1: kernel test, check mode)
+BR_TPS = (1, 2, 4)
 # branch split: mixer placement shift (the 84 down tasks end where the previous stage's 160 CTAs start)
 MIX_SHIFT = 12
 # Cache policy of the one-touch weight streams (CM_NT: nontemporal, so they do not evict the mailbox lines and
