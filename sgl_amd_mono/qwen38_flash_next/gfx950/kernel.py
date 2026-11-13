@@ -663,7 +663,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 B operand from bcolq, + 4 words per step). Scales (e8m0_shuffle, 32-row x 8-group blocks, byte
                 ((((a D + kc / 2) 4 + j) 16 + c) 2 + kc % 2) 2 + b for expert row 32 a + 16 b + c, group 4 kc + j): one
                 scale per lane and chunk (group 4 kc + j). kmask (a tail chunk): lanes where it is false load
-                nothing (an offset past the descriptor's range reads zeros) and their B operand must be zeros."""
+                nothing (an offset past the descriptor's range reads zeros), take scale 0 and their B operand must be zeros."""
                 woff = ((rg * (K // 128) + kc) * 64 + lane) * 4
                 if const_expr(kmask is not None):
                     woff = kmask.select(woff, fx.Int32(1 << 28))
@@ -688,6 +688,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 sw = sdw.shrui(
                     fx.Int32(8) * (fx.Int32(2) * (fx.Int32(kc) % 2) + fx.Int32(rg) % 2)
                 )
+                if const_expr(kmask is not None):
+                    # masked lanes: scale byte 0 (f32 0.0), whatever the pad scale bytes hold
+                    # (an e8m0 0xFF would make inf x 0 = NaN)
+                    sw = kmask.select(sw, fx.Int32(0))
                 return ("mxfp4a", (raw, sw), coef, b_word)
 
             def mma_units(acc, units, nct=NCT):

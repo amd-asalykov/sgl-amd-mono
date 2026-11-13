@@ -377,6 +377,32 @@ def test_launches_per_verify_is_the_plan():
     assert len(launch_plans(kinds)) == LY.LAUNCHES_PER_VERIFY
 
 
+@pytest.mark.parametrize("n_launches", [2, 3, 4, 13])
+def test_parity_alternates_at_odd_launch_counts(n_launches):
+    # verify_parity alternates across a step boundary iff the launch count is odd;
+    # the runner refuses an even count at TP > 1 (and accepts anything at TP 1)
+    seq = [LY.verify_parity(s, i) for s in range(4) for i in range(n_launches)]
+    alternates = all(a != b for a, b in zip(seq, seq[1:]))
+    assert alternates == (n_launches % 2 == 1)
+    LY.check_parity_launches(n_launches, 1)
+    if alternates:
+        LY.check_parity_launches(n_launches, 2)
+    else:
+        with pytest.raises(ValueError):
+            LY.check_parity_launches(n_launches, 2)
+
+
+def test_draft_refuses_tp2_until_validated():
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
+
+    d = object.__new__(R.DraftRunner)
+    d.tp = 1
+    d.refuse_tp_launch()
+    d.tp = 2  # the MTP draft is not validated at TP 2 (TP_PLAN commit 8)
+    with pytest.raises(NotImplementedError):
+        d.refuse_tp_launch()
+
+
 # ---------------------------------------------------------------- host plumbing
 @pytest.fixture
 def no_capture(monkeypatch):

@@ -206,6 +206,9 @@ class _Base:
         nbytes = LY.peer_layout(self.tp, MAX_T)["_bytes"]
         peer = PeerBuffer(nbytes, self.cpu_group, self.rank, self.tp, self.device)
         peer.bytes.zero_()
+        # the zero is queued on this rank's stream; a peer's first push (after the CPU-side
+        # compile barrier, which does not wait for the GPU) must not land before it
+        torch.cuda.synchronize(self.device)
         return peer
 
     def compile_in_lockstep(self, R: int, keys) -> None:
@@ -397,6 +400,7 @@ class VerifyRunner(_Base):
         self.cos_sin = cos_sin  # () -> SGLang's bf16 RoPE table (a cached cast)
         self.L, self.max_reqs = int(ntok), int(max_reqs)
         self.plans = launch_plans(kinds)
+        LY.check_parity_launches(len(self.plans), self.tp)
         S = self.max_reqs * self.L
         # one scratch for every R: a launch only accepts pairs tagged with its own
         # (step, launch) epoch
@@ -799,6 +803,15 @@ class DraftRunner(_Base):
         # a draft key a mode and batch size (extend: R x L_ext rows, decode: R x 1)
         self.compile_in_lockstep((R, S), [build])
         return self._keep(key, (self._upload(rows), build))
+
+    def refuse_tp_launch(self) -> None:
+        """The MTP draft has not run at TP > 1 yet (TP_PLAN commit 8): every TP > 1
+        draft launch is refused until it is validated."""
+        if self.tp > 1:
+            raise NotImplementedError(
+                f"Qwen3.8-Flash-Next monokernel: TP {self.tp} draft launches are not "
+                "validated yet (TP_PLAN commit 8)"
+            )
 
     def launch(self, fb, hidden_states: torch.Tensor):
         """A draft step -> (the draft mixer's output x [S, HIDDEN], the

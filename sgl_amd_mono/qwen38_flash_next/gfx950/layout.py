@@ -523,10 +523,26 @@ def peer_pair(src: int, rg: int, t: int, p: int, S: int) -> int:
 
 
 def verify_parity(step: int, launch_id: int) -> int:
-    """The peer-buffer half of a verify launch: a running launch count (13 launches
-    a step, odd, so it alternates across steps too; the tag's parity does not:
-    launch 12 and the next step's launch 0 share it)."""
+    """The peer-buffer half of a verify launch: ``step * 13 + launch_id`` (the
+    model's 13 launches a step, so it alternates across steps too; the tag's parity
+    does not: launch 12 and the next step's launch 0 share it). With n launches a
+    step, the last and the next step's launch 0 differ in parity iff n is odd
+    (``check_parity_launches``; the runner refuses an even count at TP > 1). The
+    halves are a second safeguard: consecutive launches never race on a region
+    anyway (a launch ends on F, the next starts on A, and a rank's push into a
+    region waits on its combine of the other, which needs every peer past its reads
+    of the first)."""
     return (step * LAUNCHES_PER_VERIFY + launch_id) & 1
+
+
+def check_parity_launches(n_launches: int, tp: int) -> None:
+    """``verify_parity`` alternates across a step boundary only with an odd launch
+    count a step (13 at 48 layers; test models: 8 layers -> 3, 4 -> 2 refused)."""
+    if tp > 1 and n_launches % 2 == 0:
+        raise ValueError(
+            f"Qwen3.8-Flash-Next monokernel: TP {tp} needs an odd launch count a "
+            f"verify step (the peer-buffer parity), got {n_launches}"
+        )
 
 
 def draft_parity(step: int) -> int:
