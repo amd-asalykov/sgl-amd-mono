@@ -122,6 +122,8 @@ POLL_MAX = 24
 BR_MAX_T = 16
 # TPs that take the branch split (validated on 2 GPUs; the code is TP-generic, TP 4 unvalidated)
 BR_TPS = (2,)
+# branch split: mixer placement shift (the 84 down tasks end where the previous stage's 160 CTAs start)
+MIX_SHIFT = 12
 # Cache policy of the one-touch weight streams (CM_NT: nontemporal, so they do not evict the mailbox lines and
 # reused data from L2 / MALL): MoE MXFP4 experts (+ scales), FP8 projections (in_proj, out_proj, qsa proj, o_proj).
 W_CM_MOE = CM_NT
@@ -1099,6 +1101,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
             def mix_ks(src):
                 return 4 if mix_branch(src) else LY.MIX_KSPLIT
+
+            def mix_shift(src):
+                """Branch split: the down tasks (84) end where the previous stage's 160 CTAs start, so the up tasks
+                run on exactly those CTAs (default: down right past them)."""
+                return MIX_SHIFT if mix_branch(src) else 0
 
             def mix_dt(src):
                 """Down tasks of the mix of src."""
@@ -5655,7 +5662,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     LY.P_HCA_NORM,
                     LY.P_HCA_DOWN,
                     LY.P_HCA_UP,
-                    base=LY.MIXA_BASE,
+                    base=LY.MIXA_BASE + mix_shift(src),
                 )
                 mark(f"{li}.mix_a")
                 tid = fresh(tid0)
@@ -5719,7 +5726,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 lane = tid % 64
                 wave = tid // 64
                 h1 = ("mb", mb(li, "h1"), "mb", mb(li, "h1ssq"), LY.NPART)
-                mbase = LY.mixm_base(kind, NT, TPW)
+                mbase = LY.mixm_base(kind, NT, TPW) + mix_shift(h1)
                 stage_mix(
                     li, "m", h1, LY.P_HCM_NORM, LY.P_HCM_DOWN, LY.P_HCM_UP, base=mbase
                 )
