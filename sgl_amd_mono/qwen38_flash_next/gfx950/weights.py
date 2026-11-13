@@ -253,6 +253,26 @@ def moe_reasons(experts, tp: int = 1) -> list[str]:
     return reasons
 
 
+_DEQUANT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+FP8_MAX = 448.0
+
+
+def requantize_fp8_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """A per-channel FP8 linear SGLang dequantized at load (weight [N, K] =
+    float(code) x scale rounded to bf16) -> (FP8 E4M3 codes [N, K], f32 scale [N]).
+    Each row holds a code of +-448 (Quark's scale is the row amax over 448), so
+    amax / 448 recovers the scale within bf16's rounding (2^-8; to an f32 ulp for
+    Quark's scales, a bf16 amax over 448) and the codes exactly (a code's 4
+    significant bits stay far inside its rounding interval under that error).
+    """
+    wf = w.float()
+    amax = wf.abs().amax(dim=1)
+    scale = amax / FP8_MAX
+    div = torch.where(amax > 0, scale, torch.ones_like(scale))
+    codes = (wf / div[:, None]).to(torch.float8_e4m3fn)
+    return codes.contiguous(), scale.contiguous()
+
+
 def proj_reasons(layer, table: dict) -> list[str]:
     """What the kernel assumes of SGLang's Quark W8A8 FP8 per-channel linears."""
     reasons = []
@@ -261,6 +281,18 @@ def proj_reasons(layer, table: dict) -> list[str]:
         sc = _get(layer, f"{name}.weight_scale")
         if not isinstance(w, torch.Tensor):
             reasons.append(f"no {name}.weight")
+            continue
+        if w.dtype in _DEQUANT_DTYPES and sc is None:
+            # SGLang serves a linear whose N is not a multiple of 16 dequantized on
+            # HIP (in_proj_ba at TP 4: 24 rows); proj_params re-quantizes it
+            n = w.shape[1] if w.shape[0] == k else w.shape[0]
+            wt = w.t() if tuple(w.shape) == (k, n) else w
+            if n % 16 == 0 or n > rows or tuple(wt.shape) != (n, k) or not wt.is_contiguous():
+                reasons.append(
+                    f"{name}.weight is a dequantized {str(w.dtype).replace('torch.', '')}"
+                    f" {tuple(w.shape)} with strides {w.stride()}, the kernel re-quantizes"
+                    f" a contiguous [n, {k}] with n not a multiple of 16 and <= {rows}"
+                )
             continue
         if w.dtype != torch.float8_e4m3fn:
             reasons.append(
@@ -339,10 +371,13 @@ def proj_params(layer, table: dict) -> dict:
     from aiter.ops.shuffle import shuffle_weight
     from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
 
-    params = dict(layer.named_parameters())
     out = {}
     for key, (name, rows, k) in table.items():
-        w, sc = params[name + ".weight"].data, params[name + ".weight_scale"].data
+        w, sc = _get(layer, name + ".weight"), _get(layer, name + ".weight_scale")
+        if sc is None and w.dtype in _DEQUANT_DTYPES:
+            # dequantized by SGLang (N not a multiple of 16): back to FP8 + scales
+            n = w.shape[1] if w.shape[0] == k else w.shape[0]
+            w, sc = requantize_fp8_rows(w.t() if tuple(w.shape) == (k, n) else w)
         n = sc.numel()
         # SGLang keeps the [N, K] weight behind a transposed view
         wt = w.t() if tuple(w.shape) == (k, n) else w

@@ -208,7 +208,13 @@ def fake_layer(kind: str, tp: int, ple: bool = False):
 
     if kind == "gdn":
         fp8("linear_attn.in_proj_qkvz", s["qkvz"], HIDDEN)
-        fp8("linear_attn.in_proj_ba", s["ba"], HIDDEN)
+        if s["ba"] % 16:
+            # SGLang serves an FP8 linear with N not a multiple of 16 dequantized on
+            # HIP: bf16 [K, N] (a transposed view), no scale (quark_w8a8_fp8.py)
+            _param(layer, "linear_attn.in_proj_ba.weight", _empty(s["ba"], HIDDEN).t())
+            layer.linear_attn.in_proj_ba.weight_scale = None
+        else:
+            fp8("linear_attn.in_proj_ba", s["ba"], HIDDEN)
         fp8("linear_attn.out_proj", HIDDEN, s["out_k"])
         _param(layer, "linear_attn.A_log", _empty(s["hv"], dtype=f32))
         _param(layer, "linear_attn.dt_bias", _empty(s["hv"]))
@@ -244,6 +250,37 @@ def test_layer_reasons_refuse_another_tp(kind, have, want):
     # the MoE and the projections are both checked
     assert any("experts." in r for r in reasons)
     assert any("proj" in r for r in reasons)
+
+
+def test_requantize_recovers_the_dequantized_fp8_linear():
+    # SGLang's dequant: bf16(float(code) x scale), with a +-448 code a row (Quark)
+    g = torch.Generator().manual_seed(0)
+    codes = (torch.randn(24, 256, generator=g) * 60).to(torch.float8_e4m3fn)
+    codes[:, 7] = 448.0
+    codes[3, 7] = -448.0
+    # Quark: scale = bf16 row amax / 448
+    scale = ((torch.rand(24, generator=g) + 0.1) * 0.5).to(torch.bfloat16).float() / 448
+    deq = (codes.float() * scale[:, None]).to(torch.bfloat16)
+    got, s = W.requantize_fp8_rows(deq)
+    assert got.dtype == torch.float8_e4m3fn and s.dtype == torch.float32
+    assert torch.equal(got.view(torch.uint8), codes.view(torch.uint8))
+    assert ((s - scale).abs() <= 2.4e-7 * scale).all()
+    # any scale: the codes stay exact, the scale within bf16's rounding
+    scale = (torch.rand(24, generator=g) + 0.1) * 1e-3
+    deq = (codes.float() * scale[:, None]).to(torch.bfloat16)
+    got, s = W.requantize_fp8_rows(deq)
+    assert torch.equal(got.view(torch.uint8), codes.view(torch.uint8))
+    assert ((s - scale).abs() <= 2.0**-8 * scale).all()
+
+
+def test_dequantized_ba_must_be_narrow():
+    layer = fake_layer("gdn", 4)
+    assert W.proj_reasons(layer, W.gdn_proj(4)) == []
+    # a dequantized linear SGLang would have kept FP8 (N a multiple of 16) is refused
+    layer = fake_layer("gdn", 2)
+    _param(layer, "linear_attn.in_proj_ba.weight", _empty(48, HIDDEN).t())
+    layer.linear_attn.in_proj_ba.weight_scale = None
+    assert any("dequantized" in r for r in W.proj_reasons(layer, W.gdn_proj(2)))
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])

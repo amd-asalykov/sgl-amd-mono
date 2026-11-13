@@ -311,11 +311,15 @@ def weights(model, kinds: list[str], tp: int = 1, rank: int = 0) -> None:
             ref_s = torch.cat([b for _, b in parts])
             n = ref_w.shape[0]
             got = packing.unshuffle16(w)
-            if not (
-                torch.equal(got[:n], ref_w)
-                and torch.equal(sc[:n], ref_s)
-                and not got[n:].any()
-            ):
+            if views._get(layer, table[k][0] + ".weight_scale") is None:
+                # re-quantized from SGLang's dequantized bf16 (views.requantize_fp8_rows):
+                # the codes exact, the scales within bf16's rounding
+                scale_ok = bool(
+                    ((sc[:n] - ref_s).abs() <= 2.0**-8 * ref_s.abs()).all()
+                )
+            else:
+                scale_ok = torch.equal(sc[:n], ref_s)
+            if not (torch.equal(got[:n], ref_w) and scale_ok and not got[n:].any()):
                 bad.append(k)
         moe = views.moe_params(layer.mlp.experts, tp)
         for e in CHECKED_EXPERTS:

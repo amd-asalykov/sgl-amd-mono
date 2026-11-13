@@ -189,7 +189,10 @@ Copied, and logged by SGLang at startup with their sizes: the bf16 tensors the k
 order (HC mixers, router with the shared expert's gate, PLE projections, MTP input fusion), packed from SGLang's
 params at build; the GDN layers' A (`-exp(A_log)`), `dt_bias` and gated-norm weight in f32; the FP8 projections
 SGLang keeps row-major (`in_proj_ba`: N is not a multiple of 64), zero-padded and shuffled; and the n-gram metadata as
-one table. The copies and the runners' buffers are allocated at build, before SGLang sizes the KV cache.
+one table. At TP 4 the rank's `in_proj_ba` has 24 rows, and SGLang serves an FP8 linear whose N is not a multiple of
+16 dequantized to bf16 on HIP: the plugin re-quantizes it per row (scale = row amax / 448), which recovers the
+checkpoint's FP8 codes exactly and its scales within bf16's rounding, so the kernel's b / a projection is the FP8 one of
+TP 1 and TP 2 (SGLang's own TP 4 forward computes it in bf16). The copies and the runners' buffers are allocated at build, before SGLang sizes the KV cache.
 
 At startup every tensor the kernel reads is checked (dtype, shape, contiguity, AITER's shuffle flag): a weight in
 another layout would not fault, it would produce plausible garbage, so the server refuses to start and names it.
