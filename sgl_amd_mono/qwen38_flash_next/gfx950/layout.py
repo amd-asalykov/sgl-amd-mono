@@ -577,4 +577,60 @@ def draft_parity(step: int) -> int:
     return step & 1
 
 
+# QSA index-chain hoist (notes/WAVE3_PLAN.md W3-4, design_hop_min A; TP form): qsa_proj runs its task n on tile
+# (n + K0) % QP_RG, K0 = the first KV tile (QP_K_OFF / 16), so round 0 (tasks [0, 256)) holds the KV and the replicated
+# index tiles. The index chain (prep-idx, scores, select, merge-select) runs on the contiguous "chain" CTAs
+# [ch0, 256) right after their round-0 tile: prep-idx of request r on CTA pidx + r, the scores on [sbase, 256 - T),
+# select from CTA 255 down (as before). The tiles past round 0 go to the CTAs [0, ch0) only (tile 256 + m on CTA
+# m % ch0), after the chain in program order. Enabled when those rounds are no more than the plain order's.
+@dataclasses.dataclass(frozen=True)
+class QsaHoist:
+    ch0: int  # first chain CTA (= pidx)
+    pidx: int  # prep-idx of request r on CTA pidx + r
+    sbase: int  # index scores base CTA
+    k0: int  # tile of task 0
+    nti: int  # rounds past round 0 (tiles of the CTAs [0, ch0) after the chain)
+    tail: int  # QSA attention tail chunk of row t on CTA tail + t
+
+
+@functools.cache
+def qsa_hoist(R: int, L: int, tp: int = 1):
+    """The QsaHoist geometry of R requests x L rows at TP ``tp``, or None (plain qsa_proj order)."""
+    g = geom(tp)
+    T = R * L
+    sbase = BLOCKS - T - scores_ctas(R)
+    pidx = sbase - R
+    ch0 = pidx
+    extra = g.QP_RG - BLOCKS
+    nti_plain = (g.QP_RG + BLOCKS - 1) // BLOCKS - 1
+    if ch0 < T + g.PREP_IDX_CTA0 or extra <= 0:
+        return None
+    nti = (extra + ch0 - 1) // ch0
+    if nti > nti_plain:
+        return None
+    prep = set(range(g.PREP_BASE, g.PREP_BASE + g.PREP_IDX_CTA0))
+    tail = ch0 - T
+    if {(tail + t) % BLOCKS for t in range(T)} & prep:
+        tail = (g.PREP_BASE - T) % BLOCKS
+    assert all(0 <= (tail + t) % BLOCKS < ch0 for t in range(T)), (R, L, tp)
+    return QsaHoist(ch0=ch0, pidx=pidx, sbase=sbase, k0=g.QP_K_OFF // 16, nti=nti, tail=tail)
+
+
+def _check_qsa_hoist():
+    for tp in TP_SIZES:
+        g = geom(tp)
+        for R in range(1, 9):
+            for L in range(1, 32 // R + 1):
+                h = qsa_hoist(R, L, tp)
+                if h is None:
+                    continue
+                # round 0 holds every KV and index tile; the later tiles are a permutation over the CTAs [0, ch0)
+                r0 = {(n + h.k0) % g.QP_RG for n in range(BLOCKS)}
+                assert set(range(g.QP_K_OFF // 16, g.QP_RG)) <= r0, (tp, R, L)
+                later = [(BLOCKS + m + h.k0) % g.QP_RG for m in range(g.QP_RG - BLOCKS)]
+                assert sorted(list(r0) + later) == list(range(g.QP_RG)), (tp, R, L)
+                assert (g.QP_RG - BLOCKS + h.ch0 - 1) // h.ch0 == h.nti
+
+
 _check_tail_base()
+_check_qsa_hoist()

@@ -287,6 +287,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     NS_MAX = LY.max_slots(NT)
     NPAIR = LY.MOE_PAIR  # (row, expert) pairs per row
     CN = LY.cnew_slots(L)
+    # QSA index-chain hoist (layout.qsa_hoist; None: the plain qsa_proj order)
+    QH = LY.qsa_hoist(R, L, TPW) if "qsa" in plan else None
     IC_STEP, IC_DIM, IC_WIN, IC_ROW = iconv_strides
     CSPLIT = LY.core_split(NT, TPW)
     C_ROWS, C_TASKS, C_RPT, C_KPT, C_RED = LY.core_geom(CSPLIT, GM.HV)
@@ -2028,10 +2030,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 else:
                     stage_f8_mb(addr, HIDDEN, ACT, S_A8, batch=A8_BATCH)
 
-            def act_gemm8(stage_phase, r_w, r_s, NTI, rg_of, emit, split=None):
+            def act_gemm8(
+                stage_phase, r_w, r_s, NTI, rg_of, emit, split=None, live=None, restage=None
+            ):
                 """Row tiles rg_of(i) (i < NTI) of a k128-packed FP8 [*, 2560] weight (F32 row scales r_s) times the S
                 FP8 activation rows staged by stage_phase() into ACT [S][S_A8]; tiles one after the other, next weights in
-                flight during the MMAs. emit(i, rg, val(r, t)) with val = dequantized output of row r, batch row t."""
+                flight during the MMAs. emit(i, rg, val(r, t)) with val = dequantized output of row r, batch row t.
+                live(i) (uniform, optional): tile i is computed and emitted only where it holds. restage (uniform,
+                optional): ACT is staged only where it holds (else it still holds this activation)."""
                 NKC = HIDDEN // 128  # 20 chunks of 128 K
                 UPW = (NKC + WAVES - 1) // WAVES
 
@@ -2075,11 +2081,13 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
                 PD = min(G8_PD, NTI)  # weight tiles in flight
                 q_ = [units_for(i) for i in range(PD)]
-                stage_phase()
-                for i in range_constexpr(NTI):
-                    if const_expr(i + PD < NTI):
-                        q_.append(units_for(i + PD))
-                    cur = q_.pop(0)
+                if const_expr(restage is None):
+                    stage_phase()
+                else:
+                    if restage:
+                        stage_phase()
+
+                def tile(i, cur):
                     gemm_tile(cur)
                     gpu.barrier()
                     rg = rg_of(i)
@@ -2094,6 +2102,17 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
                     emit(i, rg, val)
                     gpu.barrier()
+
+                for i in range_constexpr(NTI):
+                    if const_expr(i + PD < NTI):
+                        q_.append(units_for(i + PD))
+                    cur = q_.pop(0)
+                    lv = None if live is None else live(i)
+                    if const_expr(lv is None):
+                        tile(i, cur)
+                    else:
+                        if lv:
+                            tile(i, cur)
 
             def emit8_bf_rows(mbx, row_words, valid=None):
                 """emit(i, rg, val): rows [16 rg, 16 rg + 16) of every batch row -> bf16 pairs of mailbox [S][row_words]."""
@@ -3668,7 +3687,52 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     out.append((specs[i][1] % 2 == 0).select(lo, hi))
                 return out
 
-            def stage_qsa_proj(layer):
+            def stage_qsa_proj(layer, part="all"):
+                """The fused q|gate / KV / index projection: part "all" (plain order: tile bid + i G), or with the
+                index-chain hoist (QH) "r0" (tile (bid + k0) % QP_RG: KV and index tiles in round 0) then, after the
+                chain, "r123" (tile 256 + m of the CTAs [0, ch0), m = bid + i ch0)."""
+                qsplit = (
+                    GM.QP_RG_QKV,
+                    ptr(layer, LY.P_IP),
+                    ptr(layer, LY.P_IP_S),
+                    ptr(layer, LY.P_IP2),
+                    ptr(layer, LY.P_IP2_S),
+                )
+                if const_expr(part == "r0"):
+                    act_gemm8(
+                        lambda: stage_act8(mb(layer, "a.mixx")),
+                        None,
+                        None,
+                        1,
+                        lambda i: (bid + QH.k0) % GM.QP_RG,
+                        emit8_bf_rows(mb(layer, "qp"), GM.QP_ROWS // 2),
+                        split=qsplit,
+                    )
+                    return
+                if const_expr(part == "r123"):
+                    EXTRA = GM.QP_RG - G
+                    if bid < QH.ch0:
+                        act_gemm8(
+                            lambda: stage_act8(mb(layer, "a.mixx")),
+                            None,
+                            None,
+                            QH.nti,
+                            lambda i: (
+                                G + fx.min(bid + i * QH.ch0, EXTRA - 1) + QH.k0
+                            )
+                            % GM.QP_RG,
+                            emit8_bf_rows(mb(layer, "qp"), GM.QP_ROWS // 2),
+                            split=qsplit,
+                            live=None
+                            if EXTRA % QH.ch0 == 0
+                            else (
+                                lambda i: (bid + i * QH.ch0 < EXTRA)
+                                if i + 1 == QH.nti
+                                else None
+                            ),
+                            restage=qsa_chain_ran(),
+                        )
+                    return
                 act_gemm8(
                     lambda: stage_act8(mb(layer, "a.mixx")),
                     None,
@@ -3750,264 +3814,277 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 gpu.barrier()
                 return xext
 
-            def stage_qsa_prep(layer):
+            def stage_qsa_prep(layer, part="all"):
+                """part "qk": the attention q heads and the KV head(s); "idx": the index q / key ring / compression
+                (with the index-chain hoist, on the chain CTAs QH.pidx + r); "all": both (plain order)."""
                 qp = mb(layer, "qp")
                 r_cos = _rsrc(ptr(GI, LY.G_COS))
                 ptask = placed(GM.PREP_BASE)
-                if ptask < GM.PREP_Q_TASKS:
-                    h = ptask
-                    heads_norm_rope(
-                        qp,
-                        lambda row: (row, h * 512),
-                        256,
-                        ptr(layer, LY.P_QNORM),
-                        r_cos,
-                        True,
-                        PREP_OFF,
-                        NT,
-                    )
-                    NW = NT * 128
-                    for i in range_constexpr((NW + THREADS - 1) // THREADS):
-                        q = tid + i * THREADS
-                        if q < NW:
-                            t = q // 128
-                            put(
-                                mb(layer, "q"),
-                                t * (GM.HQ * 128) + h * 128 + q % 128,
-                                lds_ld(xi, PREP_OFF + q),
-                            )
-                    gpu.barrier()
-                if (ptask >= GM.PREP_K_CTA) & (ptask < GM.PREP_K_CTA + GM.KV):
-                    # the rank's KV heads (TP 2: one, head ``rank`` of the model)
-                    kvh = ptask - GM.PREP_K_CTA
-                    kvnew = mb(layer, "kvnew")
-                    r_loc = _rsrc(ptr(GI, LY.G_LOC))
-                    NW = NT * 128
-                    NIW = (NW + THREADS - 1) // THREADS
-                    qcs = [fx.min(tid + i * THREADS, NW - 1) for i in range(NIW)]
-                    # 128 threads (2 waves) per token: the KV row base is wave-uniform -> 64-bit descriptor base
-                    # (the cache slots are loaded ahead of the poll)
-                    locs = [
-                        _uniform(
-                            fx.Int32(
-                                bo.buffer_load(
-                                    r_loc, (qc // 128) * 2, vec_width=1, dtype=T.i32
+                if const_expr(part != "idx"):
+                    if ptask < GM.PREP_Q_TASKS:
+                        h = ptask
+                        heads_norm_rope(
+                            qp,
+                            lambda row: (row, h * 512),
+                            256,
+                            ptr(layer, LY.P_QNORM),
+                            r_cos,
+                            True,
+                            PREP_OFF,
+                            NT,
+                        )
+                        NW = NT * 128
+                        for i in range_constexpr((NW + THREADS - 1) // THREADS):
+                            q = tid + i * THREADS
+                            if q < NW:
+                                t = q // 128
+                                put(
+                                    mb(layer, "q"),
+                                    t * (GM.HQ * 128) + h * 128 + q % 128,
+                                    lds_ld(xi, PREP_OFF + q),
                                 )
-                            )
-                        )
-                        for qc in qcs
-                    ]
-                    # v shares the k poll round
-                    vall = heads_norm_rope(
-                        qp,
-                        lambda row: (row, GM.QP_K_OFF + kvh * 256),
-                        256,
-                        ptr(layer, LY.P_KNORM),
-                        r_cos,
-                        True,
-                        PREP_OFF,
-                        NT,
-                        extra=[
-                            (qc // 128, GM.QP_V_OFF + kvh * 256 + 2 * (qc % 128) + d_)
-                            for qc in qcs
-                            for d_ in range(2)
-                        ],
-                    )
-                    for i in range_constexpr(NIW):
-                        q = tid + i * THREADS
-                        qc = qcs[i]
-                        t = qc // 128
-                        e = qc % 128
-                        v = vall[2 * i : 2 * i + 2]
-                        loc = locs[i]
-                        r_k = _rsrc(
-                            ptr(layer, LY.P_KBUF)
-                            + fx.Int64(loc) * (GM.KV * 512)
-                            + fx.Int64(kvh * 512)
-                        )
-                        r_v = _rsrc(
-                            ptr(layer, LY.P_VBUF)
-                            + fx.Int64(loc) * (GM.KV * 512)
-                            + fx.Int64(kvh * 512)
-                        )
-                        if q < NW:
-                            kw = lds_ld(xi, PREP_OFF + q)
-                            vw = bf16_pair(v[0], v[1]).bitcast(fx.Int32)
-                            put(kvnew, t * (GM.KV * 256) + kvh * 128 + e, kw)
-                            put(
-                                kvnew,
-                                t * (GM.KV * 256) + GM.KV * 128 + kvh * 128 + e,
-                                vw,
-                            )
-                            bo.buffer_store(kw, r_k, e)
-                            bo.buffer_store(vw, r_v, e)
-                    gpu.barrier()
-                if (ptask >= GM.PREP_IDX_CTA0) & (ptask < GM.PREP_IDX_CTA0 + R):
-                    # request r: index q (4 heads x 128) of its L tokens, then its index-key ring / compression
-                    r = ptask - GM.PREP_IDX_CTA0
-                    tok0 = r * L
-                    pos0 = req_p0(r)
-                    req = _uniform(lds_ld(xi, RQ_REQ + r))
-                    rtt_row = rtt_row_of(r)
-                    r_ring = _rsrc(ptr(layer, LY.P_RING))
-                    r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
-                    gfirst = pos0 // 4  # first group that can complete in these tokens
-                    # Everything of the group compression except the batch payload is addressed by positions known at
-                    # stage start: the older ring members, the group's rope position, its (cos, sin), its
-                    # req_to_token slot and the norm weight are loaded ahead of the poll (a ring slot read here is
-                    # never one this stage's ring stores of tokens <= the group's last token write: a 4-token window).
-                    # Loads of tokens whose group does not complete are clamped in range and unused.
-                    tidk = tid % 128
-                    wk = fx.Float32(
-                        fx.BFloat16(
-                            bo.buffer_load(
-                                _rsrc(ptr(layer, LY.P_IKNORM)),
-                                tidk,
-                                vec_width=1,
-                                dtype=T.bf16,
-                            )
-                        )
-                    )
-                    pre = []
-                    for j in range_constexpr(L):
-                        pos = pos0 + j
-                        ps = pos - 3  # group start: rope position of the first member
-                        psc = fx.max(ps, fx.Int32(0))
-                        rmem = [
-                            fx.Float32(
-                                fx.BFloat16(
-                                    bo.buffer_load(
-                                        r_ring,
-                                        (req * ring + fx.max(pos - 3 + g, fx.Int32(0)) % ring)
-                                        * 128
-                                        + tidk,
-                                        vec_width=1,
-                                        dtype=T.bf16,
-                                    )
-                                )
-                            )
-                            for g in range(4)
-                        ]
-                        tsb = ps - pos0
-                        rp_buf = [
+                        gpu.barrier()
+                    if (ptask >= GM.PREP_K_CTA) & (ptask < GM.PREP_K_CTA + GM.KV):
+                        # the rank's KV heads (TP 2: one, head ``rank`` of the model)
+                        kvh = ptask - GM.PREP_K_CTA
+                        kvnew = mb(layer, "kvnew")
+                        r_loc = _rsrc(ptr(GI, LY.G_LOC))
+                        NW = NT * 128
+                        NIW = (NW + THREADS - 1) // THREADS
+                        qcs = [fx.min(tid + i * THREADS, NW - 1) for i in range(NIW)]
+                        # 128 threads (2 waves) per token: the KV row base is wave-uniform -> 64-bit descriptor base
+                        # (the cache slots are loaded ahead of the poll)
+                        locs = [
                             _uniform(
                                 fx.Int32(
                                     bo.buffer_load(
-                                        r_rp,
-                                        ((req * ring + psc % ring) * 3 + a) * 2,
-                                        vec_width=1,
-                                        dtype=T.i32,
+                                        r_loc, (qc // 128) * 2, vec_width=1, dtype=T.i32
                                     )
                                 )
                             )
-                            for a in range(3)
+                            for qc in qcs
                         ]
-
-                        done = (pos + 1) % 4 == 0
-
-                        def sp3(a, tsb=tsb, rp_buf=rp_buf, done=done):
-                            from_lds = lds_ld(
-                                xi, POS3 + a * NT + tok0 + fx.max(tsb, fx.Int32(0))
+                        # v shares the k poll round
+                        vall = heads_norm_rope(
+                            qp,
+                            lambda row: (row, GM.QP_K_OFF + kvh * 256),
+                            256,
+                            ptr(layer, LY.P_KNORM),
+                            r_cos,
+                            True,
+                            PREP_OFF,
+                            NT,
+                            extra=[
+                                (qc // 128, GM.QP_V_OFF + kvh * 256 + 2 * (qc % 128) + d_)
+                                for qc in qcs
+                                for d_ in range(2)
+                            ],
+                        )
+                        for i in range_constexpr(NIW):
+                            q = tid + i * THREADS
+                            qc = qcs[i]
+                            t = qc // 128
+                            e = qc % 128
+                            v = vall[2 * i : 2 * i + 2]
+                            loc = locs[i]
+                            r_k = _rsrc(
+                                ptr(layer, LY.P_KBUF)
+                                + fx.Int64(loc) * (GM.KV * 512)
+                                + fx.Int64(kvh * 512)
                             )
-                            # a token whose group does not complete: position 0 (its ring slot may be unwritten)
-                            return done.select(
-                                (tsb >= 0).select(from_lds, rp_buf[a]), fx.Int32(0)
+                            r_v = _rsrc(
+                                ptr(layer, LY.P_VBUF)
+                                + fx.Int64(loc) * (GM.KV * 512)
+                                + fx.Int64(kvh * 512)
                             )
-
-                        cs = rope_cs(tid, sp3, r_cos)
-                        cslot = rtt_at(rtt_row, psc) // 4
-                        pre.append((rmem, cs, cslot))
-                    # index k of every token shares the index q poll round
-                    NK = L * 128
-                    NIK = (NK + THREADS - 1) // THREADS
-                    qks = [fx.min(tid + i * THREADS, NK - 1) for i in range(NIK)]
-                    kall = heads_norm_rope(
-                        qp,
-                        lambda row: (tok0 + row // 4, GM.QP_IDX_OFF + (row % 4) * 128),
-                        128,
-                        ptr(layer, LY.P_IQNORM),
-                        r_cos,
-                        True,
-                        PREP_OFF,
-                        4 * L,
-                        extra=[
-                            (tok0 + q // 128, GM.QP_IDX_OFF + 512 + q % 128) for q in qks
-                        ],
-                    )
-                    NW = L * 256
-                    for i in range_constexpr((NW + THREADS - 1) // THREADS):
-                        q = tid + i * THREADS
-                        if q < NW:
-                            put(
-                                mb(layer, "qi"),
-                                tok0 * 256 + q,
-                                lds_ld(xi, PREP_OFF + q),
-                            )
-                    # index k of every token -> LDS (f32) and the pending ring; in token order, a completed group
-                    # (pos % 4 == 3) is compressed from its 4 members (batch members from LDS, older ones from the ring)
-                    for i in range_constexpr(NIK):
-                        if tid + i * THREADS < NK:
-                            lds_st(xs, PREP_KEYS + qks[i], kall[i])
-                    gpu.barrier()
-                    for j in range_constexpr(L):
-                        pos = pos0 + j
-                        rmem, cs, cslot = pre[j]
-                        if tid < 128:
-                            bo.buffer_store(
-                                fx.Float32(lds_ld(xs, PREP_KEYS + j * 128 + tid)).to(
-                                    fx.BFloat16
-                                ),
-                                r_ring,
-                                (req * ring + pos % ring) * 128 + tid,
-                            )
-                        if tid < 3:
-                            bo.buffer_store(
-                                fx.Vector.from_elements(
-                                    [
-                                        lds_ld(xi, POS3 + tid * NT + tok0 + j),
-                                        fx.Int32(0),
-                                    ],
-                                    fx.Int32,
-                                ),
-                                r_rp,
-                                ((req * ring + pos % ring) * 3 + tid) * 2,
-                            )
-                        if (pos + 1) % 4 == 0:
-                            acc = fx.Float32(0.0)
-                            if tid < 128:
-                                for g in range_constexpr(4):
-                                    pm = pos - 3 + g
-                                    src_batch = pm >= pos0
-                                    tb = fx.max(pm - pos0, fx.Int32(0))
-                                    from_lds = bf_round(
-                                        lds_ld(xs, PREP_KEYS + tb * 128 + tid)
-                                    )
-                                    acc = acc + src_batch.select(from_lds, rmem[g])
-                            m = bf_round(acc * 0.25)
-                            mm = (tid < 128).select(m, fx.Float32(0.0))
-                            ss = block_sums([mm * mm])[0]
-                            rstd = _rsq(ss * (1.0 / 128) + EPS)
-                            yk = bf_round(mm * rstd * (fx.Float32(1.0) + wk))
-                            ykr = bf_round(rope_apply(yk, tid, cs))
-                            yk = (tid < 64).select(ykr, yk)
-                            if tid < 128:
-                                fx.ptr_store(
-                                    yk.to(fx.BFloat16), xb + (PREP_OFF * 2 + tid)
-                                )
-                            gpu.barrier()
-                            if tid < 64:
-                                w = lds_ld(xi, PREP_OFF + tid)
+                            if q < NW:
+                                kw = lds_ld(xi, PREP_OFF + q)
+                                vw = bf16_pair(v[0], v[1]).bitcast(fx.Int32)
+                                put(kvnew, t * (GM.KV * 256) + kvh * 128 + e, kw)
                                 put(
-                                    mb(layer, "cnew"),
-                                    (r * CN + pos // 4 - gfirst) * 64 + tid,
-                                    w,
+                                    kvnew,
+                                    t * (GM.KV * 256) + GM.KV * 128 + kvh * 128 + e,
+                                    vw,
                                 )
+                                bo.buffer_store(kw, r_k, e)
+                                bo.buffer_store(vw, r_v, e)
+                        gpu.barrier()
+                if const_expr(part != "qk"):
+                    itask = (
+                        placed(QH.pidx) if part == "idx" else ptask - GM.PREP_IDX_CTA0
+                    )
+                    if (itask >= 0) & (itask < R):
+                        r = itask
+                        tok0 = r * L
+                        pos0 = req_p0(r)
+                        req = _uniform(lds_ld(xi, RQ_REQ + r))
+                        rtt_row = rtt_row_of(r)
+                        r_ring = _rsrc(ptr(layer, LY.P_RING))
+                        r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
+                        gfirst = pos0 // 4  # first group that can complete in these tokens
+                        # Everything of the group compression except the batch payload is addressed by positions known at
+                        # stage start: the older ring members, the group's rope position, its (cos, sin), its
+                        # req_to_token slot and the norm weight are loaded ahead of the poll (a ring slot read here is
+                        # never one this stage's ring stores of tokens <= the group's last token write: a 4-token window).
+                        # Loads of tokens whose group does not complete are clamped in range and unused.
+                        tidk = tid % 128
+                        wk = fx.Float32(
+                            fx.BFloat16(
+                                bo.buffer_load(
+                                    _rsrc(ptr(layer, LY.P_IKNORM)),
+                                    tidk,
+                                    vec_width=1,
+                                    dtype=T.bf16,
+                                )
+                            )
+                        )
+                        pre = []
+                        for j in range_constexpr(L):
+                            pos = pos0 + j
+                            ps = pos - 3  # group start: rope position of the first member
+                            psc = fx.max(ps, fx.Int32(0))
+                            rmem = [
+                                fx.Float32(
+                                    fx.BFloat16(
+                                        bo.buffer_load(
+                                            r_ring,
+                                            (req * ring + fx.max(pos - 3 + g, fx.Int32(0)) % ring)
+                                            * 128
+                                            + tidk,
+                                            vec_width=1,
+                                            dtype=T.bf16,
+                                        )
+                                    )
+                                )
+                                for g in range(4)
+                            ]
+                            tsb = ps - pos0
+                            rp_buf = [
+                                _uniform(
+                                    fx.Int32(
+                                        bo.buffer_load(
+                                            r_rp,
+                                            ((req * ring + psc % ring) * 3 + a) * 2,
+                                            vec_width=1,
+                                            dtype=T.i32,
+                                        )
+                                    )
+                                )
+                                for a in range(3)
+                            ]
+
+                            done = (pos + 1) % 4 == 0
+
+                            def sp3(a, tsb=tsb, rp_buf=rp_buf, done=done):
+                                from_lds = lds_ld(
+                                    xi, POS3 + a * NT + tok0 + fx.max(tsb, fx.Int32(0))
+                                )
+                                # a token whose group does not complete: position 0 (its ring slot may be unwritten)
+                                return done.select(
+                                    (tsb >= 0).select(from_lds, rp_buf[a]), fx.Int32(0)
+                                )
+
+                            cs = rope_cs(tid, sp3, r_cos)
+                            cslot = rtt_at(rtt_row, psc) // 4
+                            pre.append((rmem, cs, cslot))
+                        # index k of every token shares the index q poll round
+                        NK = L * 128
+                        NIK = (NK + THREADS - 1) // THREADS
+                        qks = [fx.min(tid + i * THREADS, NK - 1) for i in range(NIK)]
+                        kall = heads_norm_rope(
+                            qp,
+                            lambda row: (tok0 + row // 4, GM.QP_IDX_OFF + (row % 4) * 128),
+                            128,
+                            ptr(layer, LY.P_IQNORM),
+                            r_cos,
+                            True,
+                            PREP_OFF,
+                            4 * L,
+                            extra=[
+                                (tok0 + q // 128, GM.QP_IDX_OFF + 512 + q % 128) for q in qks
+                            ],
+                        )
+                        NW = L * 256
+                        for i in range_constexpr((NW + THREADS - 1) // THREADS):
+                            q = tid + i * THREADS
+                            if q < NW:
+                                put(
+                                    mb(layer, "qi"),
+                                    tok0 * 256 + q,
+                                    lds_ld(xi, PREP_OFF + q),
+                                )
+                        # index k of every token -> LDS (f32) and the pending ring; in token order, a completed group
+                        # (pos % 4 == 3) is compressed from its 4 members (batch members from LDS, older ones from the ring)
+                        for i in range_constexpr(NIK):
+                            if tid + i * THREADS < NK:
+                                lds_st(xs, PREP_KEYS + qks[i], kall[i])
+                        gpu.barrier()
+                        for j in range_constexpr(L):
+                            pos = pos0 + j
+                            rmem, cs, cslot = pre[j]
+                            if tid < 128:
                                 bo.buffer_store(
-                                    w, _rsrc(ptr(layer, LY.P_COMP)), cslot * 64 + tid
+                                    fx.Float32(lds_ld(xs, PREP_KEYS + j * 128 + tid)).to(
+                                        fx.BFloat16
+                                    ),
+                                    r_ring,
+                                    (req * ring + pos % ring) * 128 + tid,
                                 )
-                            gpu.barrier()
+                            if tid < 3:
+                                bo.buffer_store(
+                                    fx.Vector.from_elements(
+                                        [
+                                            lds_ld(xi, POS3 + tid * NT + tok0 + j),
+                                            fx.Int32(0),
+                                        ],
+                                        fx.Int32,
+                                    ),
+                                    r_rp,
+                                    ((req * ring + pos % ring) * 3 + tid) * 2,
+                                )
+                            if (pos + 1) % 4 == 0:
+                                acc = fx.Float32(0.0)
+                                if tid < 128:
+                                    for g in range_constexpr(4):
+                                        pm = pos - 3 + g
+                                        src_batch = pm >= pos0
+                                        tb = fx.max(pm - pos0, fx.Int32(0))
+                                        from_lds = bf_round(
+                                            lds_ld(xs, PREP_KEYS + tb * 128 + tid)
+                                        )
+                                        acc = acc + src_batch.select(from_lds, rmem[g])
+                                m = bf_round(acc * 0.25)
+                                mm = (tid < 128).select(m, fx.Float32(0.0))
+                                ss = block_sums([mm * mm])[0]
+                                rstd = _rsq(ss * (1.0 / 128) + EPS)
+                                yk = bf_round(mm * rstd * (fx.Float32(1.0) + wk))
+                                ykr = bf_round(rope_apply(yk, tid, cs))
+                                yk = (tid < 64).select(ykr, yk)
+                                if tid < 128:
+                                    fx.ptr_store(
+                                        yk.to(fx.BFloat16), xb + (PREP_OFF * 2 + tid)
+                                    )
+                                gpu.barrier()
+                                if tid < 64:
+                                    w = lds_ld(xi, PREP_OFF + tid)
+                                    put(
+                                        mb(layer, "cnew"),
+                                        (r * CN + pos // 4 - gfirst) * 64 + tid,
+                                        w,
+                                    )
+                                    bo.buffer_store(
+                                        w, _rsrc(ptr(layer, LY.P_COMP)), cslot * 64 + tid
+                                    )
+                                gpu.barrier()
 
             QS = 68  # LDS row stride (words) of the index q rows [4 S][128] bf16 ((stride / 4) odd)
+
+            def qsa_chain_ran():
+                """(QH) This CTA ran index scores or select tasks (past the chain CTAs only at long contexts): its ACT
+                must be staged again before the qsa_proj tiles past round 0."""
+                ntile = _uniform(lds_ld(xi, SC_PFX + R))
+                ntask = _uniform(lds_ld(xi, SL_PFX + NT))
+                return (placed(QH.sbase) * WAVES < ntile) | ((G - 1) - bid < ntask)
 
             def stage_qsa_scores(layer):
                 """Index logits of every complete block for every row: ilog[t][b] for b < nb_t = (pos_t + 1) // 4.
@@ -4017,7 +4094,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 The first item's req_to_token / compressed-key loads are issued before the qi poll, and its in-batch
                 keys (cnew) share the qi poll round."""
                 ntile = _uniform(lds_ld(xi, SC_PFX + R))
-                stask = placed(GM.SCORES_BASE)
+                stask = placed(GM.SCORES_BASE if QH is None else QH.sbase)
                 if stask * WAVES < ntile:
                     qi = mb(layer, "qi")
                     gw = stask * WAVES + wave
@@ -4742,7 +4819,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
             def stage_qsa_tail(layer):
                 """The tail chunk of token t (part slot t * ATT_TASKS + 32) on CTA tail_base + t: it needs only q and
                 kvnew / the KV cache (prep), not the selection, so it runs while scores and select run elsewhere."""
-                tt = placed(LY.tail_base(R, NT, TPW))
+                tt = placed(LY.tail_base(R, NT, TPW) if QH is None else QH.tail)
                 if tt < NT:
                     attn_task(
                         layer,
@@ -5679,7 +5756,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
-                else:
+                if const_expr(kind == "qsa" and QH is None):
                     stage_qsa_proj(li)
                     mark(f"{li}.qsa_proj")
                     tid = fresh(tid0)
@@ -5707,6 +5784,59 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     wave = tid // 64
                     stage_qsa_merge_select(li)
                     mark(f"{li}.qsa_merge_select")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_attn(li)
+                    mark(f"{li}.qsa_attn")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_merge(li)
+                    mark(f"{li}.qsa_merge")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                if const_expr(kind == "qsa" and QH is not None):
+                    # index-chain hoist: KV / index tiles, the index chain on the chain CTAs, then the q|gate tiles,
+                    # the q / KV prep and the tail chunk (every poll waits on an earlier stage of this sequence)
+                    stage_qsa_proj(li, "r0")
+                    mark(f"{li}.qsa_proj0")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_prep(li, "idx")
+                    mark(f"{li}.qsa_prep_idx")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_scores(li)
+                    mark(f"{li}.qsa_scores")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_select(li)
+                    mark(f"{li}.qsa_select")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_merge_select(li)
+                    mark(f"{li}.qsa_merge_select")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_proj(li, "r123")
+                    mark(f"{li}.qsa_proj123")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_prep(li, "qk")
+                    mark(f"{li}.qsa_prep")
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_tail(li)
+                    mark(f"{li}.qsa_tail")
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
