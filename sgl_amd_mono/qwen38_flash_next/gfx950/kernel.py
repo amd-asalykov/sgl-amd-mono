@@ -4358,9 +4358,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                 gpu.barrier()
                 # ---- S = Q K^T (MFMA): wave -> (kv head, 16-token tile), full 256 dims
-                def sphase():
+                def sphase(ks_lo=0, ks_n=8, s_slot=None):
+                    # ks_lo / ks_n: the K (dim) steps of this wave; s_slot: its S slot (default: the kv head's)
+                    s_slot = kvw if s_slot is None else s_slot
                     cacc = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for ks in range_constexpr(8):
+                    for ks in range_constexpr(ks_lo, ks_lo + ks_n):
                         dw = ks * 16 + (lane // 16) * 4
                         a = fx.ptr_load(
                             xs + (ATT_Q_OFF + (kvw * 16 + lane % 16) * ATT_KS + dw),
@@ -4383,7 +4385,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         lds_st(
                             xs,
                             ATT_S_OFF
-                            + kvw * 1024
+                            + s_slot * 1024
                             + (4 * (lane // 16) + i) * 64
                             + nt_ * 16
                             + lane % 16,
@@ -4395,8 +4397,13 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 if const_expr(KVA == 2):
                     sphase()
                 else:
+                    # one kv head (TP 2): waves 0-3 take dims [0, 128) of their token tile, waves 4-7 dims [128, 256)
+                    # into the idle second S slot; the softmax adds the halves
+                    kvw = fx.Int32(0)
                     if wave < 4:
-                        sphase()
+                        sphase(0, 4, 0)
+                    else:
+                        sphase(4, 4, 1)
                 gpu.barrier()
                 # ---- V^T into the K regions (K is dead), softmax of the 2 x 16 (padded) head rows -> P (bf16)
                 for kvh in range_constexpr(KVA):
@@ -4416,7 +4423,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 for r in range_constexpr(2 * KVA):
                     row = wave + 8 * r  # (kvh, head) row: kvh = row // 16
                     hl = row % 16
-                    sv = lds_ld(xs, ATT_S_OFF + row * 64 + lane) * (1.0 / 16.0)
+                    sv = lds_ld(xs, ATT_S_OFF + row * 64 + lane)
+                    if const_expr(KVA == 1):
+                        sv = sv + lds_ld(xs, ATT_S_OFF + 1024 + row * 64 + lane)
+                    sv = sv * (1.0 / 16.0)
                     live = okv & (hl < HPK)
                     sv = live.select(sv, fx.Float32(NEG_INF))
                     mx = sv
@@ -4437,8 +4447,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 part = mb(layer, "part")
                 pbase = task * GM.PART_STRIDE
 
-                def pvphase():
-                    for t2 in range_constexpr(4):
+                def pvphase(t2s=(0, 1, 2, 3)):
+                    for t2 in t2s:
                         n0 = nt_ * 64 + t2 * 16
                         oacc = fx.Vector.filled(4, 0.0, fx.Float32)
                         for ks in range_constexpr(2):
@@ -4479,8 +4489,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 if const_expr(KVA == 2):
                     pvphase()
                 else:
+                    # one kv head: waves w, w + 4 take the 16-dim tiles 0, 1 / 2, 3 of dims [64 (w % 4), + 64)
                     if wave < 4:
-                        pvphase()
+                        pvphase((0, 1))
+                    else:
+                        pvphase((2, 3))
                 if tid < 2 * HQ_A:
                     put(part, pbase + HQ_A * 256 + tid, lds_ld(xs, ATT_M_OFF + tid))
                 gpu.barrier()
