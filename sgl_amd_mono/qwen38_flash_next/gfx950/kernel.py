@@ -4821,48 +4821,38 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 if valid & (tokc >= pos0):
                     kvnew = mb(layer, "kvnew")
                     tb = r * L + tokc - pos0
-                    for kvh in range_constexpr(KVA):
-                        kn = poll(
-                            [
-                                (
-                                    kvnew,
-                                    tb * (KVA * 256)
-                                    + kvh * 128
-                                    + (ch + 8 * q) * 4
-                                    + 2 * hf,
-                                    2,
-                                )
-                                for q in range(4)
-                                for hf in range(2)
-                            ]
-                        )
-                        vn = poll(
-                            [
-                                (
-                                    kvnew,
-                                    tb * (KVA * 256)
-                                    + KVA * 128
-                                    + kvh * 128
-                                    + (ch + 8 * q) * 4
-                                    + 2 * hf,
-                                    2,
-                                )
-                                for q in range(4)
-                                for hf in range(2)
-                            ]
-                        )
-                        kw[kvh] = [
-                            fx.Vector.from_elements(
-                                kn[2 * q] + kn[2 * q + 1], fx.Int32
+
+                    def kvn_specs(kv_, kvh):
+                        return [
+                            (
+                                kvnew,
+                                tb * (KVA * 256)
+                                + kv_ * KVA * 128
+                                + kvh * 128
+                                + (ch + 8 * q) * 4
+                                + 2 * hf,
+                                2,
                             )
                             for q in range(4)
+                            for hf in range(2)
                         ]
-                        vw[kvh] = [
-                            fx.Vector.from_elements(
-                                vn[2 * q] + vn[2 * q + 1], fx.Int32
-                            )
+
+                    def kvn_words(kn):
+                        return [
+                            fx.Vector.from_elements(kn[2 * q] + kn[2 * q + 1], fx.Int32)
                             for q in range(4)
                         ]
+
+                    if const_expr(TPW > 1):
+                        # one kv head (KVA 1): K and V share one poll round
+                        kn = poll(kvn_specs(0, 0) + kvn_specs(1, 0))
+                        kw[0] = kvn_words(kn[:8])
+                        vw[0] = kvn_words(kn[8:])
+                    else:
+                        # TP 1 (two kv heads): one round per (kv head, K / V); merged rounds spill at R1
+                        for kvh in range_constexpr(KVA):
+                            kw[kvh] = kvn_words(poll(kvn_specs(0, kvh)))
+                            vw[kvh] = kvn_words(poll(kvn_specs(1, kvh)))
                 for kvh in range_constexpr(KVA):
                     for q in range_constexpr(4):
                         for e in range_constexpr(4):
