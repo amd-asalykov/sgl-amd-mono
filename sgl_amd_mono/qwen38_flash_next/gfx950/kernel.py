@@ -288,6 +288,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     RED_SLOT = WAVES * 64 * 4  # words of one (tile, column tile) accumulator slot
     KPG = LY.gu_kphases(NT)  # K phases (CTA halves) of the MoE gate/up
     S_GU = act_stride(HIDDEN // KPG)  # [S][2560 / KPG] gate/up activation rows
+    GU_WK = LY.gu_wsplit(NT, TPW)  # waves a gate/up task (in-CTA K split; TP 1: 1)
     # work area above the accumulator slots of tile 0 (NCT = 1: 4 tiles)
     W0 = (4 if NCT == 1 else NCT) * RED_SLOT
 
@@ -338,6 +339,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     assert GU_ACT + NT * S_GU <= PERS_OFF, (
         "gate/up activation + route tables do not fit LDS"
     )
+    # GU_WK 2: the K-half-1 waves' gate / up accumulators [4 tasks][64 lanes][2 NCT 4] f32
+    GU_XCH = GU_ACT + NT * S_GU
+    assert GU_WK == 1 or GU_XCH + (WAVES // 2) * 64 * 8 * NCT <= PERS_OFF
     # GDN core
     C_Q = W0  # [S][288] f32 conv outputs (q 128, k 128, v 32)
     C_Z = C_Q + NT * 288  # [S][32]
@@ -3008,38 +3012,73 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 ns = n_slots()
                 TPS = GM.GU_PAIRS  # tasks per slot
                 ntask = ns * TPS
-                gw = cta * WAVES + wave
-                NWV = NCTA * WAVES
-                nloop = _uniform((ntask - gw + NWV - 1) // NWV)
+                if const_expr(GU_WK == 1):
+                    gw = cta * WAVES + wave
+                    NWV = NCTA * WAVES
+                    nloop = _uniform((ntask - gw + NWV - 1) // NWV)
+                    kq = 0  # K part of this wave (GU_WK 2: wave // 4)
+                else:
+                    # GU_WK 2: waves w, w + 4 share task gw (K halves); a CTA-uniform loop (the LDS exchange barriers)
+                    TPC = WAVES // GU_WK
+                    gw = cta * TPC + wave % TPC
+                    NWV = NCTA * TPC
+                    nloop = _uniform(
+                        fx.max((ntask - cta * TPC + NWV - 1) // NWV, fx.Int32(0))
+                    )
+                    kq = wave // TPC
                 for it, _c in range(fx.Int32(0), nloop, 1, init=[fx.Int32(0)]):
                     it = fx.Int32(it)
                     task = gw + it * NWV
+                    tok = None
+                    if const_expr(GU_WK > 1):
+                        tok = task < ntask
+                        task = fx.min(task, ntask - 1)
                     sl = task // TPS
                     tile = task % TPS
                     e = _uniform(lds_ld(xi, SLOT_E + sl))
                     r_g = _rsrc(gu + fx.Int64(e) * GM.GU_BYTES)
                     r_s = _rsrc(gus + fx.Int64(e) * GM.GU_SBYTES)
-                    KTP = (HIDDEN // 128) // KPG  # 128-K chunks of this CTA's K range
+                    KTP = (HIDDEN // 128) // KPG // GU_WK  # 128-K chunks of this wave's K range
                     # units [0, KTP): gate tile `tile`; [KTP, 2 KTP): up tile `tile + 48` (w13 rows 768 + 16 tile ..)
                     accg, accu = wave_mma(
                         lambda u: unit_mxfp4a(
                             r_g,
                             r_s,
                             tile + (0 if u < KTP else GM.UP_TILE0),
-                            kh * KTP + u % KTP,
+                            (kh * KTP if GU_WK == 1 else kq * KTP) + u % KTP,
                             HIDDEN,
-                            bcolq(GU_ACT, S_GU, (u % KTP) * 64),
+                            bcolq(
+                                GU_ACT,
+                                S_GU,
+                                ((u % KTP) if GU_WK == 1 else (kq * KTP + u % KTP))
+                                * 64,
+                            ),
                         ),
                         2 * KTP,
                         KTP // 2,
                         acc_of=lambda u: 0 if u < KTP else 1,
                         nacc=2,
                     )
+                    if const_expr(GU_WK > 1):
+                        # K half 1 -> LDS; K half 0 adds it (acc order: half 0 + half 1)
+                        xo = GU_XCH + ((wave % TPC) * 64 + lane) * (8 * NCT)
+                        if kq == 1:
+                            for i in range_constexpr(4 * NCT):
+                                lds_st(xs, xo + i, accg[i])
+                                lds_st(xs, xo + 4 * NCT + i, accu[i])
+                        gpu.barrier()
+                        accg = [accg[i] + lds_ld(xs, xo + i) for i in range(4 * NCT)]
+                        accu = [
+                            accu[i] + lds_ld(xs, xo + 4 * NCT + i)
+                            for i in range(4 * NCT)
+                        ]
                     for ct in range_constexpr(NCT):
                         t = lane % 16 + 16 * ct
                         tc = fx.min(t, NT - 1)
                         rk = pair_rank(tc, sl, e, ns)
                         ok = (t < NT) & (rk >= 0)
+                        if const_expr(GU_WK > 1):
+                            ok = ok & tok & (kq == 0)
                         # this lane's 4 rows of the gate tile (and of the up tile)
                         rows = 4 * (lane // 16)
                         if const_expr(KPG == 1):
@@ -3092,6 +3131,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     ) // 2
                                     put_bf(mid, base_h, hv_h[0], hv_h[1])
                                     put_bf(mid, base_h + 1, hv_h[2], hv_h[3])
+                    if const_expr(GU_WK > 1):
+                        gpu.barrier()  # the exchange slots are read before the next task's stores
                     _ = yield [fx.Int32(0)]
                 gpu.barrier()
 
@@ -3113,7 +3154,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 cpg = G // ng  # CTAs per group
                 # rotate the group placement by the CTAs of the last gate_up round (multi-round only): the groups
                 # whose mid is complete early land on the CTAs that finish gate_up first; same tasks and sums
-                NWV_GU = (G // KPG) * WAVES
+                NWV_GU = (G // KPG) * WAVES // GU_WK
                 ntask_gu = ns * GM.GU_PAIRS
                 nr_gu = (ntask_gu + NWV_GU - 1) // NWV_GU
                 last_gu = ntask_gu - (nr_gu - 1) * NWV_GU

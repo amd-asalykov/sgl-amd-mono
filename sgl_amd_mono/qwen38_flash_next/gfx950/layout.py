@@ -118,6 +118,14 @@ def gu_kphases(T):
     return 1 if T <= 28 else 2
 
 
+def gu_wsplit(T, tp=1):
+    """Waves sharing one MoE gate/up task (an in-CTA K split, partials summed in LDS).
+    TP > 1 at T <= 4: the rank's (slot, tile) tasks (at most 41 x 20) fill only 820 of
+    the 2048 waves, so two waves take K halves (one round of 20 units a wave instead
+    of 40). TP 1 (1640 tasks) and larger T: 1 (wave-level tasks)."""
+    return 2 if tp > 1 and T <= 4 and gu_kphases(T) == 1 else 1
+
+
 def dn_sg(T):
     """Expert slots per MoE down K-group: the staged [T][SG * 640] bf16 mid of a
     group must fit the LDS."""
