@@ -4223,7 +4223,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 # one block reduction for all groups: value (pass, quarter) is the quarter's own (zeros elsewhere),
                 # so its sum is the 2 waves of the quarter, as prep's (tid < 128) sum
                 ss = block_sums_many(
-                    [(qtr == q_).select(mms[p_], fx.Float32(0.0)) for p_ in range(NPS) for q_ in range(4)]
+                    [
+                        (qtr == q_).select(mms[p_] * mms[p_], fx.Float32(0.0))
+                        for p_ in range(NPS)
+                        for q_ in range(4)
+                    ]
                 )
                 for p_ in range_constexpr(NPS):
                     r, k, valid, rmem, cs, srcb = grp[p_]
