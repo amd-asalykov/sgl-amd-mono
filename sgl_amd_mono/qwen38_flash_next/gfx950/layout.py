@@ -593,14 +593,22 @@ class QsaHoist:
     tail: int  # QSA attention tail chunk of row t on CTA tail + t
 
 
+def qsa_inline(T: int) -> bool:
+    """Index prep inlined into the index scores (WAVE3_PLAN W3-5): every scores CTA normalizes / ropes the index q
+    rows itself and compresses the groups completed inside the batch; the ring / rope-position / compressed-key
+    stores run in stage qsa_idx_writes after the selection (no prep-idx hop)."""
+    return T <= 8
+
+
 @functools.cache
 def qsa_hoist(R: int, L: int, tp: int = 1):
-    """The QsaHoist geometry of R requests x L rows at TP ``tp``, or None (plain qsa_proj order)."""
+    """The QsaHoist geometry of R requests x L rows at TP ``tp``, or None (plain qsa_proj order). With the inline
+    index prep there is no prep-idx stage in the chain: pidx is then the base of qsa_idx_writes (the scores CTAs)."""
     g = geom(tp)
     T = R * L
     sbase = BLOCKS - T - scores_ctas(R)
-    pidx = sbase - R
-    ch0 = pidx
+    pidx = sbase if qsa_inline(T) else sbase - R
+    ch0 = min(pidx, sbase)
     extra = g.QP_RG - BLOCKS
     nti_plain = (g.QP_RG + BLOCKS - 1) // BLOCKS - 1
     if ch0 < T + g.PREP_IDX_CTA0 or extra <= 0:
