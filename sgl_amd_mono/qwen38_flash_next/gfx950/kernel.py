@@ -1560,6 +1560,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 if const_expr(pre is not None)
                                 else poll(combine_specs(layer, hc, src, rg, i))
                             )
+                        if const_expr(i == 0):
+                            mark(f"{layer}.cmb_poll_{hc}", partial=True)
                         if const_expr(src[0] == "mb"):
                             hw = got[0][0]
                             gp = got[1:]
@@ -2714,6 +2716,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         )
                         if const_expr(GDN_FUSED and CPRE):
                             cgot = cbox[0]
+                    mark(f"{layer}.op_act", partial=True)
                     # K part hh + 1: weights issued before the MMA of part hh (the og polls of part hh are done)
                     nxt = part_units(1) if OP_KS > 1 else None
                     acc = mma_units(zero_acc(), units0)
@@ -2756,6 +2759,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             ov_ = red_rows(0, WAVES, r, t) * ws * lds_ld(xs, ASC + t)
                             lds_st(xs, OUTS + q, ov_)
                     gpu.barrier()
+                    mark(f"{layer}.op_mma", partial=True)
                     combine_rows(
                         layer,
                         "a",
@@ -5341,9 +5345,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
             tid0 = fx.thread_idx.x
             tl_names = []
 
-            def mark(name):
-                """Debug timeline: thread 0 stores the clock after stage ``name``."""
+            def mark(name, partial=False):
+                """Debug timeline: thread 0 stores the clock after stage ``name`` (partial: a point only some CTAs
+                pass, inside a stage's branch; its name ends in '~')."""
                 if const_expr(TL):
+                    name = name + ("~" if partial else "")
                     k = len(tl_names)
                     tl_names.append(name)
                     if tid0 == 0:
