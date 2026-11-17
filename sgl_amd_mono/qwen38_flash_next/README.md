@@ -25,7 +25,6 @@ GPU: gfx950 (MI355X), TP 1 only. Weights: the Quark checkpoint `amd/Qwen3.8-Flas
 | `gfx950/config.py` | the model geometry and `MonoBuild`, the build key of one launch |
 | `gfx950/layout.py` | compile-time geometry, pointer-table slots and the scratch (mailbox) layout, free of FlyDSL |
 | `gfx950/kernel.py` | the FlyDSL kernel of one launch (`build_qwen38_flash_next_kernel`) |
-| `gfx950/device.py` | the guarded wait of a one-GPU launch (`spin`) |
 | `gfx950/weights.py` | the layer views of SGLang's params and what the kernel assumes of them |
 | `gfx950/packing.py` | the bf16 tile packing and the pointer-table rows |
 | `gfx950/runner.py` | the buffers, pointer tables and launch sequence (`VerifyRunner`, `DraftRunner`) |
@@ -166,16 +165,17 @@ logits), `part` (attention partials), `mixx` (mixer outputs), `logit` (router), 
 ## 4. Guarded waits
 
 A wait that never completes, because of a bug or a corrupted input, would hang the GPU. Every wait goes through
-`gfx950/device.spin` under the launch's guard (`common/guard.py`):
+`common.sync._spin` under the launch's guard (`common/guard.py`), the same wait every other spec uses:
 
 - A **deadline** of half the server's `--watchdog-timeout` (at most 60 s), checked on the 100 MHz `s_memrealtime`
-  clock every 64 polls. The loop is wave-uniform and the deadline is loaded into scalar registers, so the check
-  costs no vector registers at the stage's peak. Between polls a pending wait issues a single `s_nop`.
+  clock every 64 polls. The poll count, the first check's time and the deadline (`Guard.scalar_deadline`) are
+  scalar values, so the check costs no vector registers at the stage's peak, and a lane whose words arrived stops
+  reloading them. Between polls a pending wait issues one `s_sleep 1`.
 - On a timeout the wait sets a sticky error word and stops the launch with a store to address 0x0. A launch never
   runs on with values that did not arrive (their addresses would be garbage). The GPU fault stops the process, and
   no token of the failed step reaches a client. With one GPU there are no peers to flag.
 - `SGLANG_AMD_MONO_FAULT_INJECT=0:site[:after]` stalls the wait at `site` once `after` steps have run, for the e2e
-  test of this path. It arms the target's launches only; such a build waits through `common.sync._spin`.
+  test of this path. It arms the target's launches only.
 
 ## 5. Weights
 
