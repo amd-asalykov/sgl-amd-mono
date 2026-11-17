@@ -157,6 +157,16 @@ class _Base:
         # when the table grows, and a graph still reads the old one
         self._held: dict = {}
 
+    def _uncached_scratch(self, nbytes: int) -> torch.Tensor:
+        """The hand-off mailboxes, zeroed and uncached (a one-rank
+        ``common.peer.PeerBuffer``): a consumer's load is served at the line's home
+        memory, not through the producer XCD's L2. The buffer stays for the
+        runner's life (its address is baked into the pointer tables and graphs)."""
+        from sgl_amd_mono.common.peer import PeerBuffer
+
+        self._scratch_buf = PeerBuffer(nbytes, None, 0, 1, self.device)
+        return self._scratch_buf.bytes.view(torch.int32)
+
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
         ticks = guard.deadline_ticks(seconds)
@@ -305,7 +315,7 @@ class VerifyRunner(_Base):
             LY.scratch_layout(4 + 2, r * self.L, r)[1]
             for r in range(1, self.max_reqs + 1)
         )
-        self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
+        self.scratch = self._uncached_scratch(nbytes)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.h_bufs = [torch.empty(S, HC_DIM, **bf16) for _ in range(2)]
         self.ssq_bufs = [
@@ -613,7 +623,7 @@ class DraftRunner(_Base):
             for r in range(1, self.max_reqs + 1)
             for t in (1, self.L_ext)
         )
-        self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
+        self.scratch = self._uncached_scratch(nbytes)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.x_buf = torch.empty(S, HIDDEN, **bf16)
         # draft step i + 1 reads step i's output: a step writes the buffer its

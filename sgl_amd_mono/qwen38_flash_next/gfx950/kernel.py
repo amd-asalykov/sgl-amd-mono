@@ -83,6 +83,7 @@ from sgl_amd_mono.common.ops import wave_umax as _wave_umax
 from sgl_amd_mono.common.ops import xred as _xred
 from sgl_amd_mono.common.ops import xshfl as _xshfl
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
+from sgl_amd_mono.common.sync import _spin
 
 from . import layout as LY
 from .config import (
@@ -102,7 +103,6 @@ from .config import (
     TOPK,
     MonoBuild,
 )
-from .device import spin
 from .layout import scratch_layout
 
 SOURCES = kernel_sources(__name__)
@@ -459,7 +459,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     return bad
 
                 # under the guard: a deadline, checked every CHECK_POLLS polls
-                v = spin(load_all, pending)
+                v = _spin(load_all, pending)
                 res, e = [], 0
                 for sp, ok in zip(specs, oks):
                     vals = [v[e + 2 * q] for q in range(sp[2])]
