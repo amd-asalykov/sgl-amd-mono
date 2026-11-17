@@ -142,6 +142,11 @@ PREP_IDX_CTA0 = 26
 # a stage leaves idle issue the next stage's weights while it runs (every CTA still
 # walks the stages in order: deadlock-free, outputs unchanged).
 MIXA_BASE = DN_RG  # mix-a down past the MoE combine's CTAs [0, 160)
+# branch-aligned mixer K split: one K slice per HC branch, and a placement shift (the 84
+# down tasks end where the previous stage's 160 CTAs start, so the up tasks run on
+# exactly those CTAs)
+MIX_BRANCH_KSPLIT = 4
+MIX_SHIFT = 12
 
 
 def op_base(kind, T):
@@ -157,9 +162,14 @@ def mixm_base(kind, T):
     return (op_base(kind, T) + OUT_RG) % 256
 
 
-def router_base(kind, T):
-    """router base: past the mix-m up tasks."""
-    return (mixm_base(kind, T) + MIX_DOWN_TASKS + MIX_UP_TASKS) % 256
+def router_base(kind, T, branch):
+    """router base: past the mix-m up tasks (branch: the branch-aligned K split's
+    shifted down tasks)."""
+    if branch:
+        down = MIX_SHIFT + MIX_DOWN_RG * MIX_BRANCH_KSPLIT
+    else:
+        down = MIX_DOWN_TASKS
+    return (mixm_base(kind, T) + down + MIX_UP_TASKS) % 256
 
 
 # QSA prep tasks start at CTA PREP_BASE (past the CTAs [0, 104) with a 4th qsa_proj

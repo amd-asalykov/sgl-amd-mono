@@ -238,7 +238,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     # (issued before the activation is staged)
     A8_BATCH = 12 if QB or NT > 16 else POLL_MAX
     G8_PD = 2 if QB else 1
-    S_HNS = act_stride(1024)  # [S][1024] Hn K-slice of a mix
+    # branch-aligned mixer K split: 4 K slices, one 2560-wide slice a residual branch, rstd applied after the GEMV
+    # (T in 4, 8, 16: a thread's quads lie in one row). Other T keep the 10 slices of 1024 (T = 32: a [32][2560]
+    # Hn tile would need the whole LDS).
+    MIX_BRANCH = NT in (4, 8, 16)
+    S_HNS = act_stride(2560 if MIX_BRANCH else 1024)  # [S][slice] Hn K-slice of a mix
     S_TACT = act_stride(HC_LOWRANK)  # [S][320]
     SG = LY.dn_sg(NT)  # expert slots per down K-group
     S_MID = act_stride(SG * MOE_INTER)  # [S][SG * 640]
@@ -970,19 +974,40 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     return bid
                 return (bid + (G - base)) % G
 
+            def mix_branch(src):
+                """The mix of residual source src runs the branch-aligned K split (MIX_BRANCH builds, mailbox / global
+                sources; the prelude's embedding sources keep the 10 slices)."""
+                return MIX_BRANCH and src[0] in ("mb", "global")
+
+            def mix_ks(src):
+                return LY.MIX_BRANCH_KSPLIT if mix_branch(src) else LY.MIX_KSPLIT
+
+            def mix_shift(src):
+                """Branch split: the down tasks (84) end where the previous stage's 160 CTAs start, so the up tasks
+                run on exactly those CTAs (default: down right past them)."""
+                return LY.MIX_SHIFT if mix_branch(src) else 0
+
+            def mix_dt(src):
+                """Down tasks of the mix of src."""
+                return LY.MIX_DOWN_RG * mix_ks(src)
+
             # ---- hyper-connection mix
             def stage_mix(layer, hc, src, p_norm, p_down, p_up, x_out=None, *, base):
                 """x[t] = mean_b sigmoid(W_up silu(W_down Hn[t] / HC))_b * Hn[t]_b -> mailbox mixx [T][2560];
                 combine-gate partials (per K-slice; the gate's rows are the last tile of the down weight) -> injp.
                 Down tasks start at CTA ``base``, up tasks right after the down tasks."""
                 NKC_D = HC_DIM // 64
-                CPT = NKC_D // LY.MIX_KSPLIT  # 16 chunks = 1024 K per slice
+                BR = mix_branch(src)
+                MKS = mix_ks(src)
+                MDT = mix_dt(src)
+                CPT = NKC_D // MKS  # 16 chunks = 1024 K per slice (BR: 40 = one branch)
                 CPW = CPT // WAVES
+                SLICE_Q = CPT * 16  # quads of a slice row
                 dtask = placed(base)
-                is_dn = dtask < LY.MIX_DOWN_TASKS
+                is_dn = dtask < MDT
                 r_wd = _rsrc(ptr(layer, p_down))
-                rg_d = fx.min(dtask, LY.MIX_DOWN_TASKS - 1) // LY.MIX_KSPLIT
-                ks_d = fx.min(dtask, LY.MIX_DOWN_TASKS - 1) % LY.MIX_KSPLIT
+                rg_d = fx.min(dtask, MDT - 1) // MKS
+                ks_d = fx.min(dtask, MDT - 1) % MKS
                 k0 = ks_d * (CPT * 64)
                 dunits = [
                     unit_bf16(
@@ -997,17 +1022,48 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 r_wn = _rsrc(ptr(layer, p_norm))
                 mixd = mb(layer, hc + ".mixd")
                 mixx = mb(layer, hc + ".mixx")
-                NQ = 256 * NT  # quads of the Hn K-slice [k0, k0 + 1024) of all tokens
+
+                def br_rstd(t):
+                    """BR: rstd of row t's branch ks_d from the down CTA's wave partials (wave order)."""
+                    ss = lds_ld(xs, MIX_OUTS + t * WPT)
+                    for w_ in range_constexpr(1, WPT):
+                        ss = ss + lds_ld(xs, MIX_OUTS + t * WPT + w_)
+                    return _rsq(ss * (1.0 / HIDDEN) + EPS)
+
+                # quads of the Hn K-slice [k0, k0 + 64 CPT) of all tokens
+                NQ = SLICE_Q * NT
                 NIQ = (NQ + THREADS - 1) // THREADS
                 hitems = []
-                for i in range_constexpr(NIQ):
+                # BR: a thread's quads all lie in row bt (THREADS / T threads a row, whole waves)
+                TPT = THREADS // NT
+                # wave partials of a row (T = 16: half a wave a row, one partial)
+                WPT = max(TPT // 64, 1)
+                if const_expr(BR):
+                    assert (TPT % 64 == 0 or TPT == 32) and SLICE_Q % TPT == 0
+                    NIQ = SLICE_Q // TPT
+                    bt = tid // TPT
+                for i in range_constexpr(0 if BR else NIQ):
                     # affine in i: the poll addresses share base registers
-                    if const_expr(NQ % THREADS == 0):
-                        hitems.append((tid // 256 + (THREADS // 256) * i, tid % 256))
+                    if const_expr(NQ % THREADS == 0 and THREADS % SLICE_Q == 0):
+                        hitems.append(
+                            (tid // SLICE_Q + (THREADS // SLICE_Q) * i, tid % SLICE_Q)
+                        )
+                    elif const_expr(NQ % THREADS == 0):
+                        q = tid + i * THREADS
+                        hitems.append((q // SLICE_Q, q % SLICE_Q))
                     else:
                         q = fx.min(tid + i * THREADS, NQ - 1)
-                        hitems.append((q // 256, q % 256))
-                if const_expr(src[0] == "embed"):
+                        hitems.append((q // SLICE_Q, q % SLICE_Q))
+                if const_expr(BR):
+                    hitems = [(bt, tid % TPT + TPT * i) for i in range(NIQ)]
+                # BR at T = 16 (20 quads a thread): rounds of BRQ quads, the norm weights loaded with their round
+                BRQ = NIQ if NIQ <= 10 else 5
+                if const_expr(BR):
+                    # branch slice: no rstd before the GEMV. The down CTA holds its whole branch: the sum of squares of
+                    # each row's branch, reduced over the CTA (fixed order), scales the GEMV output (rstd is a
+                    # per-(t, branch) scalar and the GEMV linear); only down CTAs read H (below)
+                    pass
+                elif const_expr(src[0] == "embed"):
                     embed_rstd(src)
                     hvs = h_quads(src, [(t, k0 // 4 + j) for t, j in hitems])
                 else:
@@ -1070,7 +1126,72 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                     gpu.barrier()
                 if is_dn:
-                    for n_ in range_constexpr(NIQ):
+                    if const_expr(BR):
+                        sst = fx.Float32(0.0)
+                        for r0 in range_constexpr(0, NIQ, BRQ):
+                            its = hitems[r0 : r0 + BRQ]
+                            br_specs = [(t, k0 // 4 + j) for t, j in its]
+                            wvr = [
+                                bo.buffer_load(
+                                    r_wn,
+                                    (k0 + 4 * j) // 2,
+                                    vec_width=2,
+                                    dtype=T.i32,
+                                )
+                                for _, j in its
+                            ]
+                            if const_expr(src[0] == "mb"):
+                                br_hv = [
+                                    fx.Vector.from_elements(g_, fx.Int32)
+                                    .bitcast(fx.BFloat16)
+                                    .to(fx.Float32)
+                                    for g_ in poll(
+                                        [
+                                            (src[1], t * (HC_DIM // 2) + q * 2, 2)
+                                            for t, q in br_specs
+                                        ]
+                                    )
+                                ]
+                            else:
+                                br_hv = h_quads(src, br_specs)
+                            for n_ in range_constexpr(len(its)):
+                                t, j = its[n_]
+                                hq = br_hv[n_]
+                                # sum of squares of row bt's branch (thread order, then the wave / half-wave butterfly)
+                                sst = sst + (
+                                    hq[0] * hq[0]
+                                    + hq[1] * hq[1]
+                                    + hq[2] * hq[2]
+                                    + hq[3] * hq[3]
+                                )
+                                wv = (
+                                    fx.Vector(wvr[n_])
+                                    .bitcast(fx.BFloat16)
+                                    .to(fx.Float32)
+                                )
+                                o = [
+                                    bf_round(hq[e] * (fx.Float32(1.0) + wv[e]))
+                                    for e in range(4)
+                                ]
+                                lds_st(
+                                    xs,
+                                    MIX_HNS + t * S_HNS + j * 2,
+                                    bf16_pair(o[0], o[1]),
+                                )
+                                lds_st(
+                                    xs,
+                                    MIX_HNS + t * S_HNS + j * 2 + 1,
+                                    bf16_pair(o[2], o[3]),
+                                )
+                        if const_expr(TPT >= 64):
+                            ws_ = wave_sum(sst)
+                            if lane == 0:
+                                lds_st(xs, MIX_OUTS + wave, ws_)
+                        else:
+                            ws_ = butterfly(sst, (16, 8, 4, 2, 1))
+                            if lane % 32 == 0:
+                                lds_st(xs, MIX_OUTS + bt, ws_)
+                    for n_ in range_constexpr(0 if BR else NIQ):
                         t, j = hitems[n_]
                         k = k0 + 4 * j
                         wv = (
@@ -1098,7 +1219,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             put(
                                 mixd,
                                 (ks_d * NT + t) * HC_LOWRANK + rg_d * 16 + r,
-                                red_rows(0, WAVES, r, t),
+                                red_rows(0, WAVES, r, t) * br_rstd(t)
+                                if BR
+                                else red_rows(0, WAVES, r, t),
                             )
                     else:  # combine-gate tile: rows 0..3 = Hn[t, slice] . Winj_b[slice]
                         if tid < 4 * NT:
@@ -1107,11 +1230,22 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             put(
                                 mb(layer, hc + ".injp"),
                                 (ks_d * NT + t) * 4 + b,
-                                red_rows(0, WAVES, b, t),
+                                red_rows(0, WAVES, b, t) * br_rstd(t)
+                                if BR
+                                else red_rows(0, WAVES, b, t),
                             )
+                        if const_expr(BR):
+                            # the gate tile also publishes rstd[t][branch] for the up epilogue (the injp slot past the
+                            # slices)
+                            if tid < NT:
+                                put(
+                                    mb(layer, hc + ".injp"),
+                                    ((LY.MIX_KSPLIT - 1) * NT + tid) * 4 + ks_d,
+                                    br_rstd(tid),
+                                )
                 # ---- up + branch mean: task u covers outputs [16u, 16u+16) of all 4 branches, all tokens
                 NKC_U = HC_LOWRANK // 64
-                utask = placed(base + LY.MIX_DOWN_TASKS)
+                utask = placed(base + MDT)
                 is_up = utask < LY.MIX_UP_TASKS
                 r_wu = rsrc_if(ptr(layer, p_up), is_up, HC_DIM * HC_LOWRANK * 2)
                 u = fx.min(utask, LY.MIX_UP_TASKS - 1)
@@ -1146,10 +1280,23 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             hspec.append(
                                 (src[1], (o_ // 64) * (HC_DIM // 2) + ko // 2, 1)
                             )
+                    # BR: + rstd[t][b] (published by the down's gate tile) on threads < 4 T
+                    rspec = (
+                        [
+                            (
+                                mb(layer, hc + ".injp"),
+                                (LY.MIX_KSPLIT - 1) * NT * 4 + fx.min(tid, 4 * NT - 1),
+                                1,
+                                tid < 4 * NT,
+                            )
+                        ]
+                        if BR
+                        else []
+                    )
                     ICH = 5  # output pairs per poll round (their 10 K-slice partials live together)
                     for i0 in range_constexpr(0, NI, ICH):
                         ii = list(range(i0, min(i0 + ICH, NI)))
-                        extra = hspec if i0 == 0 else []
+                        extra = rspec + hspec if i0 == 0 else []
                         parts = poll(
                             [
                                 (
@@ -1159,11 +1306,18 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     2,
                                 )
                                 for i in ii
-                                for s_ in range(LY.MIX_KSPLIT)
+                                for s_ in range(MKS)
                             ]
                             + extra,
                             32 if NT <= 8 else 16,
                         )
+                        if const_expr(BR and i0 == 0):
+                            if tid < 4 * NT:
+                                lds_st(
+                                    xi,
+                                    MIX_RSTD + tid,
+                                    parts[len(parts) - len(hspec) - 1][0],
+                                )
                         if const_expr(src[0] == "mb" and i0 == 0):
                             for p_ in range_constexpr(NOP):
                                 lds_st(
@@ -1176,13 +1330,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             q = qs[i]
                             d0 = fx.Float32(0.0)
                             d1 = fx.Float32(0.0)
-                            for s_ in range_constexpr(LY.MIX_KSPLIT):
-                                d0 = d0 + parts[k_ * LY.MIX_KSPLIT + s_][0].bitcast(
-                                    fx.Float32
-                                )
-                                d1 = d1 + parts[k_ * LY.MIX_KSPLIT + s_][1].bitcast(
-                                    fx.Float32
-                                )
+                            for s_ in range_constexpr(MKS):
+                                d0 = d0 + parts[k_ * MKS + s_][0].bitcast(fx.Float32)
+                                d1 = d1 + parts[k_ * MKS + s_][1].bitcast(fx.Float32)
                             d0 = d0 * (1.0 / HC)
                             d1 = d1 * (1.0 / HC)
                             if tid + i * THREADS < NPP:
@@ -1262,7 +1412,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         injp = mb(layer, hc + ".injp")
                         gspecs = [
                             (injp, (s_ * NT + t) * 4 + b, 1)
-                            for s_ in range(LY.MIX_KSPLIT)
+                            for s_ in range(mix_ks(src))
                         ]
                         # one batched poll: residual word + combine-gate partials
                         if const_expr(src[0] == "mb"):
@@ -1275,7 +1425,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             hw = h_words(src, t, [row // 2])[0]
                             gp = poll(gspecs)
                         gsum = gp[0][0].bitcast(fx.Float32)
-                        for s_ in range_constexpr(1, LY.MIX_KSPLIT):
+                        for s_ in range_constexpr(1, mix_ks(src)):
                             gsum = gsum + gp[s_][0].bitcast(fx.Float32)
                         gt = fx.Float32(2.0) * sigmoid(gsum * (1.0 / HC))
                         h0, h1 = bf2_f32(hw)
@@ -5231,7 +5381,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     LY.P_HCA_NORM,
                     LY.P_HCA_DOWN,
                     LY.P_HCA_UP,
-                    base=LY.MIXA_BASE,
+                    base=LY.MIXA_BASE + mix_shift(src),
                 )
                 tid = fresh(tid0)
                 lane = tid % 64
@@ -5409,14 +5559,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 lane = tid % 64
                 wave = tid // 64
                 h1 = ("mb", mb(li, "h1"), "mb", mb(li, "h1ssq"), LY.NPART)
-                mbase = LY.mixm_base(kind, NT)
+                mbase = LY.mixm_base(kind, NT) + mix_shift(h1)
                 stage_mix(
                     li, "m", h1, LY.P_HCM_NORM, LY.P_HCM_DOWN, LY.P_HCM_UP, base=mbase
                 )
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
-                stage_router(li, LY.router_base(kind, NT))
+                stage_router(li, LY.router_base(kind, NT, mix_branch(h1)))
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
