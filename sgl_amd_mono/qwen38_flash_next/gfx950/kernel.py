@@ -219,6 +219,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     # producers' partials) and quantized to FP8 per token while the MFMA B operands are built (no re-poll, no FP8
     # staging pass). S < 8: FP8 staging (one poll round); S = 32: FP8 staging (two-pass, bf16 rows do not fit the LDS)
     QB = 8 <= NT <= 16
+    # GDN gated RMS norm applied in out_proj (S <= 8): the core publishes the un-normalized og with per (row, task)
+    # ssq / max |og| partials; no put + poll between core tasks. S >= 16 keeps the norm in the core (neutral there).
+    NORM_IN_OP = NT <= 8
     # OP_KS: out_proj K parts staged one after the other (og [S][6144 / OP_KS]; S = 32:
     # three parts keep the weights in registers); OG_BATCH: og polls per round
     if QB:
@@ -285,6 +288,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     OUTS = W0  # small per-stage outputs ([S][16] words, merge scratch) after the GEMM (ACT dead)
     ACT = W0 + 256
     assert ACT + NT * S_OG <= TAIL_OFF, "out_proj activation does not fit LDS"
+    # GDN out_proj: [S][48] per (row, head) gated-RMS rstd x 448 / row amax (the og FP8 quantization factor)
+    OPINV = ACT + NT * S_OG
+    assert OPINV + NT * GDN_HV <= TAIL_OFF
     assert ACT + NT * S_ACT <= TAIL_OFF
     # MoE (wave-level tasks, no accumulator exchange): small outputs at 0, then the gate/up activation (live with
     # the route tables) / the staged mid of a down group
@@ -419,6 +425,17 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
             def put_bf(base_addr, i, a, b):
                 put(base_addr, i, bf16_pair(a, b))
+
+            def put2(base_addr, i, a, b):
+                """Pairs i, i + 1 := (a, tag), (b, tag) in one 16-byte store (polled as one 2-pair spec)."""
+                bo.buffer_store(
+                    fx.Vector.from_elements(
+                        [a.bitcast(fx.Int32), tag, b.bitcast(fx.Int32), tag], fx.Int32
+                    ),
+                    _rsrc(base_addr),
+                    i * 2,
+                    cache_modifier=CM_DEV,
+                )
 
             def poll(specs, batch=POLL_MAX):
                 """specs = [(base_addr, pair index, npairs in {1, 2}[, ok])] -> [[Int32 bits]]. Entries with a false
@@ -635,15 +652,17 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     fx.Int32,
                                 )
                             else:  # 32 bf16 (16 words) -> per-token FP8 (AITER: cvt(x * (1 / (amax / 448))))
+                                # bw = (word, ct -> LDS word of a per-unit factor) replaces AINV
+                                bwq, qi = bw if isinstance(bw, tuple) else (bw, None)
                                 bv = [
                                     fx.Vector(
                                         fx.ptr_load(
-                                            xs + (bw(ct) + 4 * h), result_type=v4f
+                                            xs + (bwq(ct) + 4 * h), result_type=v4f
                                         )
                                     ).bitcast(fx.Int32)
                                     for h in range(4)
                                 ]
-                                inv = invs[ct]
+                                inv = invs[ct] if qi is None else lds_ld(xs, qi(ct))
                                 words = []
                                 for j in range_constexpr(8):
                                     l0, h0 = bf2_f32(bv[j // 2][(j % 2) * 2])
@@ -1378,6 +1397,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 amax_known=False,
                 xform=None,
                 batch=POLL_MAX,
+                inv_of=None,
+                extra=None,
             ):
                 """LDS FP8 [S][n_elems] (row stride words, 4 values per word) := per-token dynamic FP8 quantization of
                 elements [elem0, elem0 + n_elems) of the packed bf16 mailbox [S][row_elems] (optionally transformed by
@@ -1391,9 +1412,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 qs = [tid + i * THREADS for i in range(NI)]
                 words = [None] * NI
 
-                def poll_batch(i0):
+                def poll_batch(i0, ex=None):
+                    xs_ = [] if ex is None else ex[0]
                     got = poll(
-                        [
+                        xs_
+                        + [
                             (
                                 base_addr,
                                 (fx.min(q, tot - 1) // nq) * (row_elems // 2)
@@ -1403,15 +1426,23 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                             for q in qs[i0 : i0 + batch]
                         ],
-                        batch,
+                        batch + len(xs_),
                     )
+                    if const_expr(ex is not None):
+                        ex[1](got[: len(xs_)])
+                    got = got[len(xs_) :]
                     for k_ in range_constexpr(len(got)):
                         words[i0 + k_] = got[k_]
 
                 def quant_store(i):
                     q = fx.min(qs[i], tot - 1)
                     v = vals_of(i)
-                    inv = lds_ld(xs, AINV + q // nq)
+                    inv = lds_ld(
+                        xs,
+                        AINV + q // nq
+                        if inv_of is None
+                        else inv_of(q // nq, elem0 + (q % nq) * 4),
+                    )
                     w01 = fx.Int32(
                         rocdl.cvt_pk_fp8_f32(
                             T.i32, v[0] * inv, v[1] * inv, fx.Int32(0), False
@@ -1436,9 +1467,12 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     return v
 
                 # quantize each poll round as it lands (no values held across rounds)
+                # extra = (specs, fn(results)): polled with the first round (amax_known only); fn runs before any
+                # quantization (e.g. to compute the scales)
+                assert extra is None or amax_known
                 if const_expr(amax_known):
                     for i0 in range_constexpr(0, NI, batch):
-                        poll_batch(i0)
+                        poll_batch(i0, extra if i0 == 0 else None)
                         for i in range_constexpr(i0, min(i0 + batch, NI)):
                             quant_store(i)
                     gpu.barrier()
@@ -1648,7 +1682,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 """Task (value head h, V-row split s), all R requests: conv1d over each request's L tokens (+ per-step
                 conv windows), b/a projections, l2norm, gated delta rule token by token on the register-resident state
                 of the request (state after every token -> intermediate_ssm[request row][step]); og[t] = o * w *
-                sigmoid(z) and per-split sum of squares."""
+                sigmoid(z) and per-split sum of squares. NORM_IN_OP: og is published un-normalized with per (row, task)
+                (ssq, max |og|) and out_proj applies the gated-RMS rstd; else the head's split ssq partials are exchanged
+                here (a put + poll between core tasks) and og is normalized."""
                 is_core = bid < C_TASKS
                 ip = mb(layer, "ip")
                 bc = fx.min(bid, C_TASKS - 1)
@@ -1954,6 +1990,27 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         [sts[r_][q][e] for q in range(NQ4) for e in range(4)]
                         for r_ in range(R)
                     ]
+
+                    def store_state(r_, j_, sv):
+                        """intermediate_ssm[request r_][step j_] := the state after token j_."""
+                        for q in range_constexpr(NQ4):
+                            st4 = fx.Vector.from_elements(
+                                sv[4 * q : 4 * q + 4], fx.Float32
+                            )
+                            off = r_ * issm_row + j_ * LY.SSM_STEP_WORDS + srow + 4 * q
+                            if const_expr(ssm_bf16):
+                                bo.buffer_store(
+                                    st4.to(fx.BFloat16).bitcast(fx.Int32),
+                                    r_is,
+                                    off // 2,
+                                )
+                            else:
+                                bo.buffer_store(st4, r_is, off)
+
+                    # NT <= 4: the per-token state stores are issued after the og / ssq puts (they would otherwise
+                    # sit in the memory queue ahead of them); the states stay in registers until then
+                    DEFER_ST = NT <= 4
+                    pend = []
                     own_o = c == 0
                     # b/a rows are dead: lanes c != 0 store their (unused) o here, no branch
                     o_junk = C_BA + tid
@@ -1995,94 +2052,123 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             o = decay * sq_ + vnew * kq
                             sv = [sv[e] * decay + kf[e] * vnew for e in range(KPT)]
                             svs[r_] = sv
-                            for q in range_constexpr(NQ4):
-                                st4 = fx.Vector.from_elements(
-                                    sv[4 * q : 4 * q + 4], fx.Float32
-                                )
-                                off = (
-                                    r_ * issm_row
-                                    + j_ * LY.SSM_STEP_WORDS
-                                    + srow
-                                    + 4 * q
-                                )
-                                if const_expr(ssm_bf16):
-                                    bo.buffer_store(
-                                        st4.to(fx.BFloat16).bitcast(fx.Int32),
-                                        r_is,
-                                        off // 2,
-                                    )
-                                else:
-                                    bo.buffer_store(st4, r_is, off)
+                            if const_expr(DEFER_ST):
+                                pend.append((r_, j_, sv))
+                            else:
+                                store_state(r_, j_, sv)
                             lds_st(xs, own_o.select(C_O + t * 32 + j, o_junk), o)
-                            fx.ptr_store(
-                                (o * nw * sigmoid(lds_ld(xs, C_Z + t * 32 + j))).to(
-                                    fx.BFloat16
-                                ),
-                                xb
-                                + own_o.select(
-                                    (C_OG + t * 16) * 2 + j, (C_BA + 512) * 2 + tid
-                                ),
-                            )
                     gpu.barrier()
-                    # outputs: per-(row, task) sum of squares of o; then, with the head's 4 split partials, the gated
-                    # RMS-normalized og = bf16(o rstd w sigmoid(z)) (one rounding, as SGLang's fused gated norm) and its
-                    # per-(row, task) max |og| (the out_proj FP8 activation scale)
-                    for t0 in range_constexpr(0, NT, WAVES):
-                        if wave + t0 < NT:
-                            t = wave + t0
-                            ov = (lane < ROWS).select(
-                                lds_ld(xs, C_O + t * 32 + fx.min(lane, ROWS - 1)),
-                                fx.Float32(0.0),
+                    if const_expr(NORM_IN_OP):
+                        # outputs (no core-internal hand-off): og = bf16(o w sigmoid(z)) un-normalized, and per (row, task)
+                        # the sum of squares of o and max |og| as one 16-byte put; out_proj reduces the head's CSPLIT ssq
+                        # partials to the gated-RMS rstd and applies it while quantizing og to FP8
+                        nwl = fx.Float32(
+                            bo.buffer_load(
+                                _rsrc(ptr(layer, LY.P_NORM_W)),
+                                s * ROWS + fx.min(lane, ROWS - 1),
+                                vec_width=1,
+                                dtype=T.f32,
                             )
-                            ss = wave_sum(ov * ov)
-                            if lane == 0:
-                                put(mb(layer, "ssq"), t * C_TASKS + bc, ss)
-                    nwl = fx.Float32(
-                        bo.buffer_load(
-                            _rsrc(ptr(layer, LY.P_NORM_W)),
-                            s * ROWS + fx.min(lane, ROWS - 1),
-                            vec_width=1,
-                            dtype=T.f32,
                         )
-                    )
-                    for t0 in range_constexpr(0, NT, WAVES):
-                        if wave + t0 < NT:
-                            t = wave + t0
-                            sq = poll(
-                                [
-                                    (mb(layer, "ssq"), t * C_TASKS + h * CSPLIT + p, 1)
-                                    for p in range(CSPLIT)
-                                ]
-                            )
-                            tot = sq[0][0].bitcast(fx.Float32)
-                            for p in range_constexpr(1, CSPLIT):
-                                tot = tot + sq[p][0].bitcast(fx.Float32)
-                            rs = _rsq(tot * (1.0 / GDN_DK) + EPS)
-                            jl = fx.min(lane, ROWS - 1)
-                            on = lds_ld(xs, C_O + t * 32 + jl) * rs * nwl
-                            og = bf_round(on * sigmoid(lds_ld(xs, C_Z + t * 32 + jl)))
-                            og = (lane < ROWS).select(og, fx.Float32(0.0))
-                            gm = fx.max(og, -og)
-                            for off in (32, 16, 8, 4, 2, 1):
-                                gm = _xred(gm, off, fx.max)
-                            nb_ = _xshfl(og, 1)
-                            if lane == 0:
-                                put(mb(layer, "og_amax"), t * C_TASKS + bc, gm)
-                            if (lane < ROWS) & (lane % 2 == 0):
-                                put_bf(
-                                    mb(layer, "og"),
-                                    t * (GDN_VAL_DIM // 2)
-                                    + (h * GDN_DK + s * ROWS + lane) // 2,
-                                    og,
-                                    nb_,
+                        for t0 in range_constexpr(0, NT, WAVES):
+                            if wave + t0 < NT:
+                                t = wave + t0
+                                jl = fx.min(lane, ROWS - 1)
+                                ov = (lane < ROWS).select(
+                                    lds_ld(xs, C_O + t * 32 + jl), fx.Float32(0.0)
                                 )
+                                og = bf_round(
+                                    ov * nwl * sigmoid(lds_ld(xs, C_Z + t * 32 + jl))
+                                )
+                                nb_ = _xshfl(og, 1)
+                                if (lane < ROWS) & (lane % 2 == 0):
+                                    put_bf(
+                                        mb(layer, "og"),
+                                        t * (GDN_VAL_DIM // 2)
+                                        + (h * GDN_DK + s * ROWS + lane) // 2,
+                                        og,
+                                        nb_,
+                                    )
+                                ss = wave_sum(ov * ov)
+                                gm = fx.max(og, -og)
+                                for off in (32, 16, 8, 4, 2, 1):
+                                    gm = _xred(gm, off, fx.max)
+                                if lane == 0:
+                                    put2(
+                                        mb(layer, "og_amax"),
+                                        (t * C_TASKS + bc) * 2,
+                                        ss,
+                                        gm,
+                                    )
+                    else:
+                        # outputs: per-(row, task) sum of squares of o; then, with the head's 4 split partials, the gated
+                        # RMS-normalized og = bf16(o rstd w sigmoid(z)) (one rounding, as SGLang's fused gated norm) and its
+                        # per-(row, task) max |og| (the out_proj FP8 activation scale)
+                        for t0 in range_constexpr(0, NT, WAVES):
+                            if wave + t0 < NT:
+                                t = wave + t0
+                                ov = (lane < ROWS).select(
+                                    lds_ld(xs, C_O + t * 32 + fx.min(lane, ROWS - 1)),
+                                    fx.Float32(0.0),
+                                )
+                                ss = wave_sum(ov * ov)
+                                if lane == 0:
+                                    put(mb(layer, "ssq"), t * C_TASKS + bc, ss)
+                        nwl = fx.Float32(
+                            bo.buffer_load(
+                                _rsrc(ptr(layer, LY.P_NORM_W)),
+                                s * ROWS + fx.min(lane, ROWS - 1),
+                                vec_width=1,
+                                dtype=T.f32,
+                            )
+                        )
+                        for t0 in range_constexpr(0, NT, WAVES):
+                            if wave + t0 < NT:
+                                t = wave + t0
+                                sq = poll(
+                                    [
+                                        (
+                                            mb(layer, "ssq"),
+                                            t * C_TASKS + h * CSPLIT + p,
+                                            1,
+                                        )
+                                        for p in range(CSPLIT)
+                                    ]
+                                )
+                                tot = sq[0][0].bitcast(fx.Float32)
+                                for p in range_constexpr(1, CSPLIT):
+                                    tot = tot + sq[p][0].bitcast(fx.Float32)
+                                rs = _rsq(tot * (1.0 / GDN_DK) + EPS)
+                                jl = fx.min(lane, ROWS - 1)
+                                on = lds_ld(xs, C_O + t * 32 + jl) * rs * nwl
+                                og = bf_round(
+                                    on * sigmoid(lds_ld(xs, C_Z + t * 32 + jl))
+                                )
+                                og = (lane < ROWS).select(og, fx.Float32(0.0))
+                                gm = fx.max(og, -og)
+                                for off in (32, 16, 8, 4, 2, 1):
+                                    gm = _xred(gm, off, fx.max)
+                                nb_ = _xshfl(og, 1)
+                                if lane == 0:
+                                    put(mb(layer, "og_amax"), t * C_TASKS + bc, gm)
+                                if (lane < ROWS) & (lane % 2 == 0):
+                                    put_bf(
+                                        mb(layer, "og"),
+                                        t * (GDN_VAL_DIM // 2)
+                                        + (h * GDN_DK + s * ROWS + lane) // 2,
+                                        og,
+                                        nb_,
+                                    )
+                    for k_ in range_constexpr(len(pend)):
+                        store_state(*pend[k_])
                     gpu.barrier()
 
             # ---- norm + out_proj + combine
             def stage_out_proj(layer, src, kind):
                 """W8A8 out_proj (GDN) / o_proj (QSA) + combine. The activation (GDN: the gated-RMS-normalized og, QSA: the
                 merged attention output) is quantized per row with the scale from the producers' max |og| partials;
-                output = acc x weight row scale x activation scale."""
+                output = acc x weight row scale x activation scale. GDN under NORM_IN_OP: og arrives un-normalized and is
+                quantized with the per (row, head) factor OPINV = rstd x 448 / amax(normalized row)."""
                 optask = placed(LY.op_base(kind, NT))
                 is_op = optask < LY.OUT_RG
                 rg = fx.min(optask, LY.OUT_RG - 1)
@@ -2105,13 +2191,98 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 rg_p,
                                 kc,
                                 NKC,
-                                bcolq(ACT, S_OG, (kc - hh * NKH) * 64)
+                                (
+                                    (
+                                        bcolq(ACT, S_OG, (kc - hh * NKH) * 64),
+                                        lambda ct, kc=kc: (
+                                            OPINV + tcol(ct) * GDN_HV + kc
+                                        ),
+                                    )
+                                    if kind == "gdn" and NORM_IN_OP
+                                    else bcolq(ACT, S_OG, (kc - hh * NKH) * 64)
+                                )
                                 if QB
                                 else bcol8(ACT, S_OG, (kc - hh * NKH) * 32),
                                 q=QB,
                             )
                         )
                     return part
+
+                gdn_inv = (
+                    (lambda row, e: OPINV + row * GDN_HV + e // 128)
+                    if kind == "gdn" and NORM_IN_OP
+                    else None
+                )
+                # GDN: per (row, core task) (ssq of o, max |og|) -> the head's CSPLIT ssq partials (adjacent lanes) ->
+                # gated-RMS rstd; the row amax of the normalized og = max over the tasks' rstd x max |og| (a wave's 64
+                # tasks lie in one row); OPINV[t][head] = rstd x 448 / amax
+                NA = C_TASKS * NT
+                assert C_TASKS % 64 == 0 and GDN_DK == 128
+                NIA = (NA + THREADS - 1) // THREADS
+                # 16-byte polls per round (next to the out_proj weights)
+                AB = min(NIA, 3)
+                # S < 8 (one og part, one FP8 staging round): the scale partials are polled with the og (with the
+                # bf16 staging at S = 8 this measured slower: the scale reduction then sits between the og rounds)
+                GDN_FUSED = kind == "gdn" and NORM_IN_OP and not QB and OP_KS == 1
+
+                def gdn_scale_specs(ii):
+                    return [
+                        (mb(layer, "og_amax"), fx.min(tid + i * THREADS, NA - 1) * 2, 2)
+                        for i in ii
+                    ]
+
+                def gdn_scale_part(ii, got):
+                    for k_ in range_constexpr(len(ii)):
+                        i = ii[k_]
+                        idx = fx.min(tid + i * THREADS, NA - 1)
+                        ss = got[k_][0].bitcast(fx.Float32)
+                        for off in range_constexpr(0, (CSPLIT - 1).bit_length()):
+                            ss = _xred(ss, 1 << off, lambda x_, y_: x_ + y_)
+                        rs = _rsq(ss * (1.0 / GDN_DK) + EPS)
+                        if (lane % CSPLIT == 0) & (tid + i * THREADS < NA):
+                            lds_st(
+                                xs,
+                                OPINV
+                                + (idx // C_TASKS) * GDN_HV
+                                + (idx % C_TASKS) // CSPLIT,
+                                rs,
+                            )
+                        v = got[k_][1].bitcast(fx.Float32) * rs
+                        for off in (32, 16, 8, 4, 2, 1):
+                            v = _xred(v, off, fx.max)
+                        if lane == 0:
+                            lds_st(red, i * WAVES + wave, v)
+
+                def gdn_scale_finish():
+                    gpu.barrier()
+                    if tid < NT:
+                        NPR = C_TASKS // 64
+                        am = lds_ld(red, tid * NPR)
+                        for k_ in range_constexpr(1, NPR):
+                            am = fx.max(am, lds_ld(red, tid * NPR + k_))
+                        am = fx.max(am, fx.Float32(1e-12))
+                        lds_st(xs, ASC + tid, am * (1.0 / 448.0))
+                        lds_st(xs, AINV + tid, fx.Float32(1.0) / (am * (1.0 / 448.0)))
+                    gpu.barrier()
+                    for q0 in range_constexpr(0, NT * GDN_HV, THREADS):
+                        q = tid + q0
+                        if q < NT * GDN_HV:
+                            lds_st(
+                                xs,
+                                OPINV + q,
+                                lds_ld(xs, OPINV + q) * lds_ld(xs, AINV + q // GDN_HV),
+                            )
+                    gpu.barrier()
+
+                def gdn_scale_all(got):
+                    gdn_scale_part(list(range(NIA)), got)
+                    gdn_scale_finish()
+
+                gdn_extra = (
+                    (gdn_scale_specs(list(range(NIA))), gdn_scale_all)
+                    if GDN_FUSED
+                    else None
+                )
 
                 units0 = part_units(0)
                 if is_op:
@@ -2127,43 +2298,57 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         )
                     og_amax = mb(layer, "og_amax")
                     if const_expr(kind == "gdn"):
-                        # row amax = max over the core tasks' max |og| (a wave's 64 tasks lie in one row)
-                        NA = C_TASKS * NT
-                        assert C_TASKS % 64 == 0
-                        NIA = (NA + THREADS - 1) // THREADS
-                        # S <= 16: one poll round; S = 32: one partial at a time (next to the out_proj weights)
-                        vam = (
-                            poll(
-                                [
-                                    (og_amax, fx.min(tid + i * THREADS, NA - 1), 1)
-                                    for i in range(NIA)
-                                ]
+                        if const_expr(NORM_IN_OP and not GDN_FUSED):
+                            for i0 in range_constexpr(0, NIA, AB):
+                                ii = list(range(i0, min(i0 + AB, NIA)))
+                                gdn_scale_part(ii, poll(gdn_scale_specs(ii)))
+                            gdn_scale_finish()
+                        if const_expr(not NORM_IN_OP):
+                            # row amax = max over the core tasks' max |og| (a wave's 64 tasks lie in one row)
+                            NA0 = C_TASKS * NT
+                            assert C_TASKS % 64 == 0
+                            NIA0 = (NA0 + THREADS - 1) // THREADS
+                            # S <= 16: one poll round; S = 32: one partial at a time (next to the out_proj weights)
+                            vam = (
+                                poll(
+                                    [
+                                        (og_amax, fx.min(tid + i * THREADS, NA0 - 1), 1)
+                                        for i in range(NIA0)
+                                    ]
+                                )
+                                if NT <= 16
+                                else None
                             )
-                            if NT <= 16
-                            else None
-                        )
-                        for i in range_constexpr(NIA):
-                            if const_expr(NT <= 16):
-                                v = vam[i][0].bitcast(fx.Float32)
-                            else:
-                                v = poll(
-                                    [(og_amax, fx.min(tid + i * THREADS, NA - 1), 1)]
-                                )[0][0].bitcast(fx.Float32)
-                            for off in (32, 16, 8, 4, 2, 1):
-                                v = _xred(v, off, fx.max)
-                            if lane == 0:
-                                lds_st(red, i * WAVES + wave, v)
-                        gpu.barrier()
-                        if tid < NT:
-                            NPR = C_TASKS // 64
-                            am = lds_ld(red, tid * NPR)
-                            for k_ in range_constexpr(1, NPR):
-                                am = fx.max(am, lds_ld(red, tid * NPR + k_))
-                            am = fx.max(am, fx.Float32(1e-12))
-                            lds_st(xs, ASC + tid, am * (1.0 / 448.0))
-                            lds_st(
-                                xs, AINV + tid, fx.Float32(1.0) / (am * (1.0 / 448.0))
-                            )
+                            for i in range_constexpr(NIA0):
+                                if const_expr(NT <= 16):
+                                    v = vam[i][0].bitcast(fx.Float32)
+                                else:
+                                    v = poll(
+                                        [
+                                            (
+                                                og_amax,
+                                                fx.min(tid + i * THREADS, NA0 - 1),
+                                                1,
+                                            )
+                                        ]
+                                    )[0][0].bitcast(fx.Float32)
+                                for off in (32, 16, 8, 4, 2, 1):
+                                    v = _xred(v, off, fx.max)
+                                if lane == 0:
+                                    lds_st(red, i * WAVES + wave, v)
+                            gpu.barrier()
+                            if tid < NT:
+                                NPR = C_TASKS // 64
+                                am = lds_ld(red, tid * NPR)
+                                for k_ in range_constexpr(1, NPR):
+                                    am = fx.max(am, lds_ld(red, tid * NPR + k_))
+                                am = fx.max(am, fx.Float32(1e-12))
+                                lds_st(xs, ASC + tid, am * (1.0 / 448.0))
+                                lds_st(
+                                    xs,
+                                    AINV + tid,
+                                    fx.Float32(1.0) / (am * (1.0 / 448.0)),
+                                )
                     else:
                         if tid < NT:  # merge tasks published max |og| per (row, head)
                             got = poll(
@@ -2188,6 +2373,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             row_elems=GDN_VAL_DIM,
                             amax_known=True,
                             batch=OG_BATCH,
+                            inv_of=gdn_inv,
+                            extra=gdn_extra,
                         )
                 if is_op:
                     # K part hh + 1: weights issued before the MMA of part hh (the og polls of part hh are done)
@@ -2218,6 +2405,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 elem0=hh * KP,
                                 amax_known=True,
                                 batch=OG_BATCH,
+                                inv_of=gdn_inv,
                             )
                         acc = mma_units(acc, cur)
                     store_acc(acc)
