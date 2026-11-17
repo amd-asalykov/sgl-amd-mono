@@ -58,6 +58,7 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_NT,
     bf2_f32,
     bf16_pair,
 )
@@ -108,6 +109,11 @@ from .layout import scratch_layout
 SOURCES = kernel_sources(__name__)
 
 POLL_MAX = 24
+# Cache policy of the one-touch weight streams (CM_NT: nontemporal, so they do not evict the mailbox lines and
+# reused data from L2 / MALL): MoE MXFP4 experts (+ scales), FP8 projections (in_proj, out_proj, qsa proj, o_proj).
+W_CM_MOE = CM_NT
+W_CM_F8 = CM_NT
+W_CM_BF16 = 0  # mixers / router / PLE / MTP: several CTAs re-read them; CM_NT measured ~1.7% slower
 NEG_INF = -3.0e38
 LDS_WORDS = 40448  # 158 KB arena (gfx950: 160 KB per CU)
 RED_OFF = 0  # MFMA accumulator exchange: [tile][column tile][wave][lane][4] f32
@@ -505,7 +511,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     act_off + tcol(ct) * stride + k_word + (lane // 16) * 4
                 )
 
-            def unit_bf16(w_rsrc, rg, kc, NKC, b_word, coef=None, subs=(0, 1)):
+            def unit_bf16(
+                w_rsrc, rg, kc, NKC, b_word, coef=None, subs=(0, 1), cm=W_CM_BF16
+            ):
                 """16 rows x 64 K (chunk kc; subs: its 32-K halves to use) of a packed bf16 weight."""
                 wv = [
                     (
@@ -516,6 +524,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 (((rg * NKC + kc) * 2 + sp) * 64 + lane) * 4,
                                 vec_width=4,
                                 dtype=T.i32,
+                                cache_modifier=cm,
                             )
                         ),
                     )
@@ -537,6 +546,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             + (lane % 16) * 4,
                             vec_width=4,
                             dtype=T.i32,
+                            cache_modifier=W_CM_F8,
                         )
                     )
                     for h in range(2)
@@ -565,6 +575,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ((((rg // 2) * D + d) * 4 + lane // 16) * 16 + lane % 16),
                         vec_width=1,
                         dtype=T.i32,
+                        cache_modifier=W_CM_MOE,
                     )
                 )
 
@@ -581,13 +592,22 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ((rg * (K // 128) + kc) * 64 + lane) * 4,
                         vec_width=4,
                         dtype=T.i32,
+                        cache_modifier=W_CM_MOE,
                     )
                 )
                 D = (K // 32 + 7) // 8
                 dw = (((rg // 2) * D + kc // 2) * 4 + lane // 16) * 16 + lane % 16
                 # sdw: the dword preloaded by the task (mxfp4a_sdw)
                 if const_expr(sdw is None):
-                    sdw = fx.Int32(bo.buffer_load(s_rsrc, dw, vec_width=1, dtype=T.i32))
+                    sdw = fx.Int32(
+                        bo.buffer_load(
+                            s_rsrc,
+                            dw,
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=W_CM_MOE,
+                        )
+                    )
                 sw = sdw.shrui(
                     fx.Int32(8) * (fx.Int32(2) * (fx.Int32(kc) % 2) + fx.Int32(rg) % 2)
                 )
