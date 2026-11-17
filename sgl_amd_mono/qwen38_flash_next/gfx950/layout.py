@@ -132,6 +132,31 @@ PREP_K_CTA = 24  # CTAs 24, 25: k head (norm+rope) + v -> KV cache
 PREP_IDX_CTA0 = 26
 
 
+# Stage placement: task k of a placed stage runs on CTA (base + k) % 256, so the CTAs
+# a stage leaves idle issue the next stage's weights while it runs (every CTA still
+# walks the stages in order: deadlock-free, outputs unchanged).
+MIXA_BASE = DN_RG  # mix-a down past the MoE combine's CTAs [0, 160)
+
+
+def op_base(kind, T):
+    """out_proj / o_proj base: past the GDN core's CTAs [0, C_TASKS) (192) for T > 4
+    (at T = 4, CTA 0 measured faster), or past the QSA merge's last round."""
+    if kind == "gdn":
+        return GDN_HV * core_split(T) if T > 4 else 0
+    return (T * MERGE_TASKS) % 256
+
+
+def mixm_base(kind, T):
+    """mix-m down base: past out_proj."""
+    return (op_base(kind, T) + OUT_RG) % 256
+
+
+# QSA prep tasks start at CTA PREP_BASE (past the CTAs [0, 104) with a 4th qsa_proj
+# tile: 872 = 3 x 256 + 104), the index scores right after them
+PREP_BASE = QP_RG % 256
+SCORES_BASE = PREP_BASE + PREP_IDX_CTA0 + 8  # + MAX_R
+
+
 def sel2_cta0(T):
     """CTAs [256 - T, 256): merge of the segment top-512s of row t (long contexts)."""
     return 256 - T
