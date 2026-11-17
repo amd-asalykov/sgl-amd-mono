@@ -5,6 +5,9 @@ launch, kept free of FlyDSL so it is testable without a GPU.
 A launch serves R requests x L verify tokens = S rows (S <= 32). Every activation
 mailbox is row-major [S][n], row t = request t // L, draft step t % L."""
 
+import dataclasses
+import functools
+
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, padded
 
 from .config import (
@@ -196,6 +199,76 @@ def _check_tail_base():
 
 
 _check_tail_base()
+
+
+# QSA index-chain hoist: qsa_proj runs its task n on tile (n + k0) % QP_RG, k0 = the
+# first KV tile (QP_K_OFF / 16), so round 0 (tasks [0, 256)) holds the KV and the
+# index tiles. The index chain (index prep, scores, select, merge-select) runs on the
+# contiguous "chain" CTAs [ch0, 256) right after their round-0 tile: the index prep
+# of request r on CTA pidx + r, the scores on [sbase, 256 - T), select from CTA 255
+# down (as before). The tiles past round 0 go to the CTAs [0, ch0) only (tile 256 + m
+# on CTA m % ch0), after the chain in program order. Enabled only when those rounds
+# are no more than the plain order's.
+@dataclasses.dataclass(frozen=True)
+class QsaHoist:
+    ch0: int  # first chain CTA
+    pidx: int  # index prep of request r on CTA pidx + r (inline: qsa_idx_writes base)
+    sbase: int  # index scores base CTA
+    k0: int  # tile of task 0
+    nti: int  # rounds past round 0 (tiles of the CTAs [0, ch0) after the chain)
+    tail: int  # QSA attention tail chunk of row t on CTA tail + t
+
+
+def qsa_inline(T: int) -> bool:
+    """Index prep inlined into the index scores: every scores CTA normalizes / ropes
+    the index q rows itself and compresses the groups completed inside the batch; the
+    ring / rope-position / compressed-key stores run in stage qsa_idx_writes after the
+    selection (no separate index-prep stage, so one CTA-to-CTA hand-off less)."""
+    return T <= 8
+
+
+@functools.cache
+def qsa_hoist(R: int, L: int):
+    """The QsaHoist geometry of R requests x L rows, or None (plain qsa_proj order).
+    With the inline index prep there is no index-prep stage in the chain: pidx is then
+    the base of qsa_idx_writes (the scores CTAs)."""
+    T = R * L
+    sbase = BLOCKS - T - scores_ctas(R)
+    pidx = sbase if qsa_inline(T) else sbase - R
+    ch0 = min(pidx, sbase)
+    extra = QP_RG - BLOCKS
+    nti_plain = (QP_RG + BLOCKS - 1) // BLOCKS - 1
+    if ch0 < T + PREP_IDX_CTA0 or extra <= 0:
+        return None
+    nti = (extra + ch0 - 1) // ch0
+    if nti > nti_plain:
+        return None
+    prep = set(range(PREP_BASE, PREP_BASE + PREP_IDX_CTA0))
+    tail = ch0 - T
+    if {(tail + t) % BLOCKS for t in range(T)} & prep:
+        tail = (PREP_BASE - T) % BLOCKS
+    assert all(0 <= (tail + t) % BLOCKS < ch0 for t in range(T)), (R, L)
+    return QsaHoist(
+        ch0=ch0, pidx=pidx, sbase=sbase, k0=QP_K_OFF // 16, nti=nti, tail=tail
+    )
+
+
+def _check_qsa_hoist():
+    for R in range(1, 9):
+        for L in range(1, 32 // R + 1):
+            h = qsa_hoist(R, L)
+            if h is None:
+                continue
+            # round 0 holds every KV and index tile; the later tiles are a permutation
+            # over the CTAs [0, ch0)
+            r0 = {(n + h.k0) % QP_RG for n in range(BLOCKS)}
+            assert set(range(QP_K_OFF // 16, QP_RG)) <= r0, (R, L)
+            later = [(BLOCKS + m + h.k0) % QP_RG for m in range(QP_RG - BLOCKS)]
+            assert sorted(list(r0) + later) == list(range(QP_RG)), (R, L)
+            assert (QP_RG - BLOCKS + h.ch0 - 1) // h.ch0 == h.nti
+
+
+_check_qsa_hoist()
 
 
 SEL_STRIDE = 1026  # pairs per token: (block, loc) as 2 pairs each, count at pair 1024
