@@ -247,10 +247,12 @@ a warmup builds are the ones its graph capture finds.
   shuffles and that the layout constants match SGLang's AITER MoE weight sizes.
 - **Kernel test** (`test/kernels/test_qwen38_flash_next_launches.py`, one gfx950 GPU, no checkpoint: 12 layers and an
   MTP head of random weights in SGLang's post-load layouts): every launch kind (prelude, PLE, middle, final mixer, MTP
-  draft extend and decode) at 1 and 8 requests and 7 padded to 8, verify steps on MRoPE positions. Each step leaves
+  draft extend and decode) at 1 and 8 requests and 7 padded to 8, verify steps on MRoPE positions, each on an 8-slot
+  and on SGLang's 4-slot index-key ring. Each step leaves
   the error words zero, writes only its own pool rows, also from a CUDA graph, which replays an unpadded step bitwise
   and a padded one's layer 0-3 states but KV slot 0 (see Limitations); the prelude's n-gram embedding and context are
-  bitwise a torch reference's; every MoE block matches an f32 router and an a16w4 torch MoE. A verify step on
+  bitwise a torch reference's; every MoE block matches an f32 router and an a16w4 torch MoE; every compressed index key
+  a step writes matches a torch reference (RoPE at its group's first position). A verify step on
   SGLang's 4-slot index-key ring equals, bitwise, the same step on an 8-slot ring holding the same pending
   members.
   The GDN and QSA layers are covered by check mode.
