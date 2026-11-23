@@ -165,12 +165,9 @@ logits), `part` (attention partials), `mixx` (mixer outputs), `logit` (router), 
 ## 4. Guarded waits
 
 A wait that never completes, because of a bug or a corrupted input, would hang the GPU. Every wait goes through
-`common.sync._spin` under the launch's guard (`common/guard.py`), the same wait every other spec uses:
+`common.sync._spin` under the launch's guard (`common/guard.py`):
 
-- A **deadline** of half the server's `--watchdog-timeout` (at most 60 s), checked on the 100 MHz `s_memrealtime`
-  clock every 64 polls. The poll count, the first check's time and the deadline (`Guard.scalar_deadline`) are
-  scalar values, so the check costs no vector registers at the stage's peak, and a lane whose words arrived stops
-  reloading them. Between polls a pending wait issues one `s_sleep 1`.
+- A **deadline** of half the server's `--watchdog-timeout` (at most 60 s).
 - On a timeout the wait sets a sticky error word and stops the launch with a store to address 0x0. A launch never
   runs on with values that did not arrive (their addresses would be garbage). The GPU fault stops the process, and
   no token of the failed step reaches a client. With one GPU there are no peers to flag.
