@@ -504,8 +504,6 @@ class VerifyRunner(_Base):
         frow[LY.P_HCA_UP] = self.final["up"].data_ptr()
         frow[LY.P_HCA_INJ] = last["hca"]["inj"].data_ptr()  # its combine gate is unused
         iconv = issm_row = ple_ist_row = ssm_bf16 = None
-        # the RoPE positions' one store of the step: the last QSA layer (every QSA
-        # layer reads the pre-step positions; layout.P_RP_STORE)
         rp_layer = max(i for i, k in enumerate(self.kinds) if k == "qsa")
         tables = []
         for li, (_, layer_ids) in enumerate(self.plans):
@@ -517,7 +515,7 @@ class VerifyRunner(_Base):
                         packing.qsa_ptr_row(
                             t,
                             *_qsa_buffers(kvp, layer_id),
-                            rp_store=layer_id == rp_layer,
+                            layer_id == rp_layer,
                         )
                     )
                     continue

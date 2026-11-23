@@ -3010,10 +3010,6 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # (pos % 4 == 3) is compressed from its 4 members (batch members from LDS, older ones from the ring)
                     r_ring = _rsrc(ptr(layer, LY.P_RING))
                     r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
-                    # The RoPE positions are one buffer for all layers. With ring <= L + 2 a batch token's
-                    # position lands in the start slot of a group that completes in the batch, which a later
-                    # QSA layer of the step reads: only the step's last QSA layer stores them, so every layer
-                    # reads the positions as they were before the step (layout.P_RP_STORE).
                     rp_flag = (
                         ptr(layer, LY.P_RP_STORE) if const_expr(ring <= L + 2) else None
                     )

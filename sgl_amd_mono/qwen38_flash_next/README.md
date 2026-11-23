@@ -252,7 +252,7 @@ a warmup builds are the ones its graph capture finds.
   and a padded one's layer 0-3 states but KV slot 0 (see Limitations); the prelude's n-gram embedding and context are
   bitwise a torch reference's; every MoE block matches an f32 router and an a16w4 torch MoE. A verify step on
   SGLang's 4-slot index-key ring equals, bitwise, the same step on an 8-slot ring holding the same pending
-  members (every QSA layer compresses a group that straddles the batch at its start position).
+  members.
   The GDN and QSA layers are covered by check mode.
 - **Check mode** (`SGLANG_AMD_MONO_CHECK=1`): at build, the weights the launches read of layers 0, 1 and 3 (and
   experts 0, 255, 511 and the shared expert) are compared exactly against the checkpoint's safetensors. Then

@@ -559,13 +559,10 @@ def test_draft_step(draft, requests, rows):
 
 @pytest.mark.parametrize("requests", [2, 8], ids=["R=2", "R=8"])
 def test_verify_ring4(target, requests):
-    """SGLang's 4-slot index-key ring: a verify step of L = 4 rows a request rewrites
-    every ring slot, so the start slot of a group that completes in the batch
-    (contexts 1203, 70001, 32766, 140003: pos0 % 4 != 0) gets a batch token's key and
-    RoPE position. The RoPE positions are one buffer for all QSA layers; every QSA
-    layer must still compress the group at its start position: the step equals the
-    same step on an 8-slot ring holding the same pending members, bitwise (outputs,
-    every layer's compressed keys, the ring and RoPE rows written)."""
+    """A verify step on SGLang's 4-slot index-key ring (groups that straddle the batch:
+    contexts 1203, 70001, 32766, 140003) equals, bitwise, the same step on an 8-slot
+    ring holding the same pending members: outputs, every QSA layer's compressed keys,
+    the ring and RoPE rows written (README, 2.)."""
     pools, runner = target.pools, target.runner
     qsa = [i for i in pools.kv]
     b = step_batch(requests, seed=requests)
@@ -602,7 +599,9 @@ def test_verify_ring4(target, requests):
         use(rings8, rp8)
         pools.restore(target.snap)
         want = run()
-        for name, g_, w_ in zip(["x", "h"] + [f"L{i}.comp" for i in qsa], got, want):
+        for name, g_, w_ in zip(
+            ["x", "h"] + [f"L{i}.comp" for i in qsa], got, want, strict=True
+        ):
             assert _same(g_, w_), f"ring 4 vs ring 8: {name} differs"
         for r, c in enumerate(CONTEXTS[:requests]):
             q = pools.reqs[r]
