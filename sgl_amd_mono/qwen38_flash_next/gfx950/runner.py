@@ -515,7 +515,7 @@ class VerifyRunner(_Base):
                         packing.qsa_ptr_row(
                             t,
                             *_qsa_buffers(kvp, layer_id),
-                            layer_id == rp_layer,
+                            rp_store=layer_id == rp_layer,
                         )
                     )
                     continue
