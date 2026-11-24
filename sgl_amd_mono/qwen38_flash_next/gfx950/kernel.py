@@ -939,10 +939,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 return (bid + (G - base)) % G
 
             # ---- hyper-connection mix
-            def stage_mix(layer, hc, src, p_norm, p_down, p_up, x_out=None, base=0):
+            def stage_mix(layer, hc, src, p_norm, p_down, p_up, x_out=None, *, base):
                 """x[t] = mean_b sigmoid(W_up silu(W_down Hn[t] / HC))_b * Hn[t]_b -> mailbox mixx [T][2560];
                 combine-gate partials (per K-slice; the gate's rows are the last tile of the down weight) -> injp.
-                Down tasks start at CTA ``base``, up tasks right after them (on the CTAs the down leaves idle)."""
+                Down tasks start at CTA ``base``, up tasks right after the down tasks."""
                 NKC_D = HC_DIM // 64
                 CPT = NKC_D // LY.MIX_KSPLIT  # 16 chunks = 1024 K per slice
                 CPW = CPT // WAVES
@@ -2248,7 +2248,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     gpu.barrier()
 
             # ---- MoE
-            def stage_router(layer, base=0):
+            def stage_router(layer, base):
                 rtask = placed(base)
                 if rtask < LY.ROUTER_RG:
                     logit = mb(layer, "logit")
@@ -4625,8 +4625,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
-                # past the mix-m up tasks
-                stage_router(li, mbase + LY.MIX_DOWN_TASKS + LY.MIX_UP_TASKS)
+                stage_router(li, LY.router_base(kind, NT))
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64

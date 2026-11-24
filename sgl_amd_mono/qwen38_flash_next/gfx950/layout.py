@@ -13,6 +13,7 @@ from .config import (
     HC_DIM,
     HC_LOWRANK,
     HIDDEN,
+    MAX_R,
     MOE_INTER,
     N_EXPERTS,
     TOPK,
@@ -151,10 +152,15 @@ def mixm_base(kind, T):
     return (op_base(kind, T) + OUT_RG) % 256
 
 
+def router_base(kind, T):
+    """router base: past the mix-m up tasks."""
+    return (mixm_base(kind, T) + MIX_DOWN_TASKS + MIX_UP_TASKS) % 256
+
+
 # QSA prep tasks start at CTA PREP_BASE (past the CTAs [0, 104) with a 4th qsa_proj
 # tile: 872 = 3 x 256 + 104), the index scores right after them
 PREP_BASE = QP_RG % 256
-SCORES_BASE = PREP_BASE + PREP_IDX_CTA0 + 8  # + MAX_R
+SCORES_BASE = PREP_BASE + PREP_IDX_CTA0 + MAX_R
 
 
 def sel2_cta0(T):
