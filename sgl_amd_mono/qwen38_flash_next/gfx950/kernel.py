@@ -321,6 +321,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     PREP_OFF = W0  # prep scratch
     PREP_KEYS = W0 + 1024  # index-key ring of a request's tokens: [L][128] f32
     assert QI_OFF + 4 * NT * 68 <= TAIL_OFF and PREP_KEYS + L * 128 <= TAIL_OFF
+    # the prep's index path reads its index q [L * 256] at PREP_OFF, then writes PREP_KEYS with no barrier between
+    assert PREP_OFF + L * 256 <= PREP_KEYS
 
     # MTP input fusion (first_src "mtp"): B rows = S normalized embedding rows + 4 S (row, branch) hidden rows,
     # staged in MF_KP K phases; E / H column tiles reduced through red slots after the last phase (B dead)
@@ -2819,13 +2821,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     fx.Int32(1), ((m3 == 2) & (i < 30)).select(fx.Int32(2), fx.Int32(0))
                 )
 
-            def rope_elem(x, e, p3, r_cos):
-                """Neox rope of element e (< 64, lanes = elements within one wave) with partner x[e ^ 32].
-                p3: callable axis -> position."""
-                return rope_apply(x, e, rope_cs(e, p3, r_cos))
-
             def rope_apply(x, e, cs):
-                """rope_elem with the (cos, sin) of rope_cs (loaded ahead of the producer poll)."""
+                """Neox rope of element e (< 64, lanes = elements within one wave) with partner x[e ^ 32], with the
+                (cos, sin) of rope_cs (loaded ahead of the producer poll)."""
                 partner = _xshfl(x, 32)
                 c, sn = cs
                 return (e < 32).select(x * c - partner * sn, x * c + partner * sn)
@@ -3488,6 +3486,12 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     cache_modifier=CM_DEV,
                 )
 
+            def sel_count(n):
+                """Blocks the top-512 selection keeps of n candidate blocks: all of them up to 512. The segment
+                select (n: the segment's blocks), the merge (n: a segment's candidates) and the attention (n: the
+                row's blocks, which it counts itself instead of polling the select's count) all use it."""
+                return fx.min(fx.Int32(512), n)
+
             def stage_qsa_select(layer):
                 """Top-512 blocks per row. Task (row t, segment s), tasks from the top CTA down: exact radix top-512 of
                 the blocks [8192 s, 8192 s + 8192) (16 per thread). One segment (contexts < 32k): the result is final
@@ -3510,7 +3514,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     ITEMS = LY.SEG_BLOCKS // THREADS  # 16
                     b0 = sg * LY.SEG_BLOCKS
                     nbs = fx.min(fx.max(nb - b0, fx.Int32(0)), fx.Int32(LY.SEG_BLOCKS))
-                    topk = fx.min(fx.Int32(512), nbs)
+                    topk = sel_count(nbs)
                     item_idx = [
                         b0 + tid + THREADS * j_ for j_ in range_constexpr(ITEMS)
                     ]  # interleaved
@@ -3565,10 +3569,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     if nseg > 1:
                         # segment i holds min(512, its block count) candidates (known without polling cand_n)
                         cnt = [
-                            fx.min(
-                                fx.Int32(512),
-                                fx.max(nb - i * LY.SEG_BLOCKS, fx.Int32(0)),
-                            )
+                            sel_count(fx.max(nb - i * LY.SEG_BLOCKS, fx.Int32(0)))
                             for i in range(LY.NSEG_MAX)
                         ]
                         item_ok = [
@@ -3616,9 +3617,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 j = tid // 8
                 ch = tid % 8
                 qmb = mb(layer, "q")
-                # the selection count is min(512, nb) (single segment: min(512, nbs), nbs = nb <= 8192; merged
-                # segments: 512 < nb) -> computed here, so q and this thread's (block, loc) share one poll round
-                nsel = fx.min(fx.Int32(512), seq // 4)
+                # the select's count, computed here (sel_count), so q and this thread's (block, loc) share one poll
+                # round
+                nsel = sel_count(seq // 4)
                 qspec = [(qmb, t * (24 * 128) + tid + i * THREADS, 1) for i in range(6)]
                 if const_expr(is_blk):
                     si = c * 16 + j // 4
