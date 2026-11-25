@@ -3855,7 +3855,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
 
             def stage_qsa_tail(layer):
                 """The tail chunk of token t (part slot t * ATT_TASKS + 32) on CTA tail_base + t: it needs only q and
-                kvnew / the KV cache (prep), not the selection, so it runs while scores and select run elsewhere."""
+                kvnew / the KV cache (prep), not the selection, so it runs while scores and select run elsewhere.
+                It comes after the scores / select stages in program order (right before the attention): on the CTAs
+                they leave idle it still starts right after the prep, and on a CTA that also has a scores tile (a
+                context past ~8k widens the scores) it no longer delays that tile."""
                 tt = placed(LY.tail_base(R, NT))
                 if tt < NT:
                     attn_task(
@@ -4683,10 +4686,6 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
-                    stage_qsa_tail(li)
-                    tid = fresh(tid0)
-                    lane = tid % 64
-                    wave = tid // 64
                     stage_qsa_scores(li)
                     tid = fresh(tid0)
                     lane = tid % 64
@@ -4696,6 +4695,11 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     lane = tid % 64
                     wave = tid // 64
                     stage_qsa_merge_select(li)
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    # after the selection stages, so a CTA's scores / select tasks never wait for its tail task
+                    stage_qsa_tail(li)
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64

@@ -176,7 +176,8 @@ def _tail_ctas(base, T):
 
 def scores_ctas(R):
     """CTAs of the index scores at an ~8k context: 2048 + 1 compressed blocks -> 129 tiles of 16 per request,
-    8 tiles per CTA (the 129th, the newest block, gates the select of the request's last rows)."""
+    8 tiles per CTA (the 129th, the newest block, gates the select of the request's last rows). Longer contexts
+    use more CTAs and can reach the tail's; that costs only the tail, which runs after the scores (stage order)."""
     return (R * (2048 // 16 + 1) + 7) // 8
 
 
