@@ -222,6 +222,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     # GDN gated RMS norm applied in out_proj (S <= 8): the core publishes the un-normalized og with per (row, task)
     # ssq / max |og| partials; no put + poll between core tasks. S >= 16 keeps the norm in the core (neutral there).
     NORM_IN_OP = NT <= 8
+    # the core then writes 2 og_amax words per (row, core task); the scratch holds MAX_CORE_SPLIT per (row, head)
+    assert not NORM_IN_OP or 2 * LY.core_split(NT) <= LY.MAX_CORE_SPLIT
     # OP_KS: out_proj K parts staged one after the other (og [S][6144 / OP_KS]; S = 32:
     # three parts keep the weights in registers); OG_BATCH: og polls per round
     if QB:
@@ -303,8 +305,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     C_Q = W0  # [S][288] f32 conv outputs (q 128, k 128, v 32)
     C_Z = C_Q + NT * 288  # [S][32]
     C_O = C_Z + NT * 32  # [S][32]
-    C_OG = C_O + NT * 32  # [S][16] words (bf16 og)
-    C_SC = C_OG + NT * 16  # [S][4] beta, decay, k.q
+    C_SC = C_O + NT * 32  # [S][4] beta, decay, k.q
     C_BA = C_SC + 4 * NT  # [2][2560] bf16 b/a projection rows of the head
     assert C_BA + HIDDEN <= TAIL_OFF
     # MoE down: staged mid of a slot group
@@ -541,11 +542,12 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                     for sp in subs
                 ]
-                return ("bf16", wv, coef, b_word)
+                return ("bf16", wv, coef, b_word, None)
 
-            def unit_f8(w_rsrc, rg, kc, NKC, b_word, coef=None, q=False):
+            def unit_f8(w_rsrc, rg, kc, NKC, b_word, coef=None, q=False, qinv=None):
                 """16 rows x 128 K (chunk kc of NKC) of a k128-packed FP8 weight (two 1 KB halves). q: the activation is
-                bf16 in LDS (b_word from bcolq), quantized with AINV of the lane's row when the B operand is built."""
+                bf16 in LDS (b_word from bcolq), quantized when the B operand is built with AINV of the lane's row, or
+                with qinv(ct), the LDS word of a per-unit factor, if given."""
                 # SGLang's AITER layout (shuffle_weight (16, 16) of the FP8 [N, K] weight): the (rg, kc) tile is 2 KB at
                 # word (rg NKC + kc) 512, lane (r, g) half h holds K 128 kc + 32 g + 16 h .. +16 at word (2 g + h) 64 + 4 r
                 wv = [
@@ -562,7 +564,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     )
                     for h in range(2)
                 ]
-                return ("f8q" if q else "f8", wv, coef, b_word)
+                return ("f8q" if q else "f8", wv, coef, b_word, qinv)
 
             def bcolq(act_off, stride, k_word):
                 """-> (ct -> LDS word of this lane's 32 bf16 activation values for the 128-K chunk at k_word (bf16 words))."""
@@ -622,7 +624,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 sw = sdw.shrui(
                     fx.Int32(8) * (fx.Int32(2) * (fx.Int32(kc) % 2) + fx.Int32(rg) % 2)
                 )
-                return ("mxfp4a", (raw, sw), coef, b_word)
+                return ("mxfp4a", (raw, sw), coef, b_word, None)
 
             def mma_units(acc, units, nct=NCT):
                 """acc: nct x 4 f32 (column tile major); every unit's weights feed the MFMAs of all column tiles."""
@@ -630,7 +632,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 invs = None
                 if const_expr(any(u[0] == "f8q" for u in units)):
                     invs = [lds_ld(xs, AINV + tcol(ct)) for ct in range(nct)]
-                for fmt, wv, coef, bw in units:
+                for fmt, wv, coef, bw, qinv in units:
                     # 16 x 128 FP8 weight tile x 128 x 16 FP8 activation (W8A8)
                     if const_expr(fmt in ("f8", "f8q")):
                         a8 = fx.Vector.from_elements(
@@ -652,17 +654,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     fx.Int32,
                                 )
                             else:  # 32 bf16 (16 words) -> per-token FP8 (AITER: cvt(x * (1 / (amax / 448))))
-                                # bw = (word, ct -> LDS word of a per-unit factor) replaces AINV
-                                bwq, qi = bw if isinstance(bw, tuple) else (bw, None)
                                 bv = [
                                     fx.Vector(
                                         fx.ptr_load(
-                                            xs + (bwq(ct) + 4 * h), result_type=v4f
+                                            xs + (bw(ct) + 4 * h), result_type=v4f
                                         )
                                     ).bitcast(fx.Int32)
                                     for h in range(4)
                                 ]
-                                inv = invs[ct] if qi is None else lds_ld(xs, qi(ct))
+                                inv = invs[ct] if qinv is None else lds_ld(xs, qinv(ct))
                                 words = []
                                 for j in range_constexpr(8):
                                     l0, h0 = bf2_f32(bv[j // 2][(j % 2) * 2])
@@ -2191,19 +2191,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 rg_p,
                                 kc,
                                 NKC,
-                                (
-                                    (
-                                        bcolq(ACT, S_OG, (kc - hh * NKH) * 64),
-                                        lambda ct, kc=kc: (
-                                            OPINV + tcol(ct) * GDN_HV + kc
-                                        ),
-                                    )
-                                    if kind == "gdn" and NORM_IN_OP
-                                    else bcolq(ACT, S_OG, (kc - hh * NKH) * 64)
-                                )
+                                bcolq(ACT, S_OG, (kc - hh * NKH) * 64)
                                 if QB
                                 else bcol8(ACT, S_OG, (kc - hh * NKH) * 32),
                                 q=QB,
+                                # GDN with the norm in out_proj: the factor of the (row, head) chunk
+                                qinv=(lambda ct, kc=kc: OPINV + tcol(ct) * GDN_HV + kc)
+                                if QB and kind == "gdn" and NORM_IN_OP
+                                else None,
                             )
                         )
                     return part

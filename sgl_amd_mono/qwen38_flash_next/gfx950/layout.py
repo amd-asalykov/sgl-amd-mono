@@ -304,7 +304,8 @@ def scratch_layout(n_layers: int, T: int, R: int = 1):
         add(p + "ip", T * IP_ROWS // 2)  # bf16 pairs
         # per (token, head, split) sum of squares of the GDN output
         add(p + "ssq", T * GDN_HV * MAX_CORE_SPLIT)
-        # per (row, producer task) max |og| (the FP8 activation scale)
+        # per (row, producer task) max |og| (the FP8 activation scale); with the norm in out_proj
+        # (sum of o^2, max |og|), 2 words, so 2 * core_split <= MAX_CORE_SPLIT (asserted by the kernel)
         add(p + "og_amax", T * GDN_HV * MAX_CORE_SPLIT)
         add(p + "h1", T * HC_DIM // 2)  # bf16 pairs
         add(p + "h1ssq", T * 4 * NPART)
